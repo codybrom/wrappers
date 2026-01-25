@@ -50,6 +50,9 @@ struct OpenApiFdw {
     next_cursor: Option<String>,
     next_url: Option<String>,
 
+    // Path parameters extracted from WHERE clause (for injecting back into rows)
+    path_params: std::collections::HashMap<String, String>,
+
     // Data buffers
     src_rows: Vec<JsonValue>,
     src_idx: usize,
@@ -101,28 +104,112 @@ impl OpenApiFdw {
         Ok(())
     }
 
-    /// Build the URL for a request, handling pushdown and pagination
-    fn build_url(&self, ctx: &Context) -> String {
+    /// Extract a qual value as a string
+    fn qual_value_to_string(qual: &bindings::supabase::wrappers::types::Qual) -> Option<String> {
+        if qual.operator() != "=" {
+            return None;
+        }
+        if let Value::Cell(cell) = qual.value() {
+            match cell {
+                Cell::String(s) => Some(s),
+                Cell::I32(n) => Some(n.to_string()),
+                Cell::I64(n) => Some(n.to_string()),
+                Cell::F32(n) => Some(n.to_string()),
+                Cell::F64(n) => Some(n.to_string()),
+                Cell::Bool(b) => Some(b.to_string()),
+                _ => None,
+            }
+        } else {
+            None
+        }
+    }
+
+    /// Build the URL for a request, handling path parameters and pagination
+    ///
+    /// Supports endpoint templates like:
+    /// - `/stations/{station_id}/observations`
+    /// - `/gridpoints/{wfo}/{x},{y}/forecast`
+    /// - `/zones/{type}/{zone_id}`
+    ///
+    /// Path parameters are substituted from WHERE clause quals.
+    /// Returns (url, path_params) where path_params maps column names to values.
+    fn build_url(
+        &self,
+        ctx: &Context,
+    ) -> (String, std::collections::HashMap<String, String>) {
+        // Use next_url for pagination if available
+        if let Some(ref next_url) = self.next_url {
+            return (next_url.clone(), self.path_params.clone());
+        }
+
         let quals = ctx.get_quals();
+        let mut extracted_params: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
 
-        // Check for ID pushdown (WHERE id = 'x') - case insensitive comparison
-        let id_pushdown = quals.iter().find(|q| {
-            q.field().to_lowercase() == self.rowid_col.to_lowercase() && q.operator() == "="
-        });
-
-        if let Some(id_qual) = id_pushdown {
-            if let Value::Cell(Cell::String(id)) = id_qual.value() {
-                // Direct resource access: /endpoint/{id}
-                return format!("{}{}/{}", self.base_url, self.endpoint, id);
+        // Build a map of qual field -> value for path parameter substitution
+        let mut qual_map: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for qual in &quals {
+            if let Some(value) = Self::qual_value_to_string(qual) {
+                // Store both original and lowercase versions for flexible matching
+                qual_map.insert(qual.field().to_lowercase(), value.clone());
+                qual_map.insert(qual.field(), value);
             }
         }
 
-        // Build URL with pagination
-        if let Some(ref next_url) = self.next_url {
-            return next_url.clone();
+        // Substitute path parameters in endpoint template
+        // e.g., /stations/{station_id}/observations -> /stations/KAUS/observations
+        let mut endpoint = self.endpoint.clone();
+        let mut path_params_used: Vec<String> = Vec::new();
+
+        // Find all {param} patterns and substitute
+        while let Some(start) = endpoint.find('{') {
+            if let Some(end) = endpoint[start..].find('}') {
+                let param_name = &endpoint[start + 1..start + end];
+                let param_lower = param_name.to_lowercase();
+
+                // Try to find matching qual (case-insensitive)
+                let value = qual_map
+                    .get(&param_lower)
+                    .or_else(|| qual_map.get(param_name));
+
+                if let Some(val) = value {
+                    path_params_used.push(param_lower.clone());
+                    // Store the path param for injection into rows
+                    extracted_params.insert(param_lower.clone(), val.clone());
+                    endpoint = format!(
+                        "{}{}{}",
+                        &endpoint[..start],
+                        val,
+                        &endpoint[start + end + 1..]
+                    );
+                } else {
+                    // No value for this param - leave as is (will likely cause API error)
+                    break;
+                }
+            } else {
+                break;
+            }
         }
 
-        let mut base = format!("{}{}", self.base_url, self.endpoint);
+        // Check for rowid pushdown for single-resource access
+        // Only if endpoint doesn't already have path params and rowid qual exists
+        if path_params_used.is_empty() {
+            if let Some(id_qual) = quals.iter().find(|q| {
+                q.field().to_lowercase() == self.rowid_col.to_lowercase() && q.operator() == "="
+            }) {
+                if let Some(id) = Self::qual_value_to_string(id_qual) {
+                    // Store rowid as path param too
+                    extracted_params.insert(self.rowid_col.to_lowercase(), id.clone());
+                    return (
+                        format!("{}{}/{}", self.base_url, endpoint, id),
+                        extracted_params,
+                    );
+                }
+            }
+        }
+
+        let mut base = format!("{}{}", self.base_url, endpoint);
         let mut params = Vec::new();
 
         // Add pagination cursor if we have one
@@ -135,26 +222,21 @@ impl OpenApiFdw {
             params.push(format!("{}={}", self.page_size_param, self.page_size));
         }
 
-        // Add query params from quals (for supported fields)
+        // Add remaining quals as query params (exclude path params and rowid)
         for qual in &quals {
-            // Skip the rowid column for list queries
-            if qual.field() == self.rowid_col {
+            let field_lower = qual.field().to_lowercase();
+
+            // Skip if used as path param
+            if path_params_used.contains(&field_lower) {
                 continue;
             }
 
-            // Only push down simple equality quals
-            if qual.operator() != "=" {
+            // Skip the rowid column
+            if field_lower == self.rowid_col.to_lowercase() {
                 continue;
             }
 
-            if let Value::Cell(cell) = qual.value() {
-                let value = match cell {
-                    Cell::String(s) => s,
-                    Cell::I32(n) => n.to_string(),
-                    Cell::I64(n) => n.to_string(),
-                    Cell::Bool(b) => b.to_string(),
-                    _ => continue,
-                };
+            if let Some(value) = Self::qual_value_to_string(qual) {
                 params.push(format!("{}={}", qual.field(), value));
             }
         }
@@ -164,12 +246,13 @@ impl OpenApiFdw {
             base.push_str(&params.join("&"));
         }
 
-        base
+        (base, extracted_params)
     }
 
     /// Make a request to the API
     fn make_request(&mut self, ctx: &Context) -> FdwResult {
-        let url = self.build_url(ctx);
+        let (url, path_params) = self.build_url(ctx);
+        self.path_params = path_params;
 
         let req = http::Request {
             method: http::Method::Get,
@@ -355,7 +438,14 @@ impl OpenApiFdw {
 
         let src = match src {
             Some(v) if !v.is_null() => v,
-            _ => return Ok(None),
+            _ => {
+                // If not found in JSON, check if this column is a path parameter
+                // (inject value from WHERE clause so PostgreSQL filter passes)
+                if let Some(value) = self.path_params.get(&tgt_col_name.to_lowercase()) {
+                    return Ok(Some(Cell::String(value.clone())));
+                }
+                return Ok(None);
+            }
         };
 
         // Type conversion based on target column type
@@ -559,11 +649,11 @@ impl Guest for OpenApiFdw {
                 .push(("authorization".to_owned(), format!("Bearer {}", token)));
         }
 
-        // Pagination defaults
+        // Pagination defaults (page_size=0 means no automatic limit parameter)
         this.page_size = opts
             .get("page_size")
             .and_then(|s| s.parse().ok())
-            .unwrap_or(100);
+            .unwrap_or(0);
 
         this.page_size_param = opts.require_or("page_size_param", "limit");
         this.cursor_param = opts.require_or("cursor_param", "after");
