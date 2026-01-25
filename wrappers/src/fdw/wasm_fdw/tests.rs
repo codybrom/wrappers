@@ -578,6 +578,169 @@ mod tests {
                 .filter_map(|r| r.get_by_name::<&str, _>("name").unwrap())
                 .collect::<Vec<_>>();
             assert_eq!(results, vec!["John Doe"]);
+
+            // Test path parameter substitution: /users/{user_id}/posts
+            c.update(
+                r#"
+                  CREATE FOREIGN TABLE openapi_user_posts (
+                    id text,
+                    user_id text,
+                    title text,
+                    content text,
+                    attrs jsonb
+                  )
+                  SERVER openapi_server
+                  OPTIONS (
+                    endpoint '/users/{user_id}/posts',
+                    rowid_column 'id'
+                  )
+             "#,
+                None,
+                &[],
+            )
+            .unwrap();
+
+            let results = c
+                .select(
+                    "SELECT user_id, title FROM openapi_user_posts WHERE user_id = 'user-123'",
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .filter_map(|r| r.get_by_name::<&str, _>("title").unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(results, vec!["First Post", "Second Post"]);
+
+            // Test multiple path parameters: /projects/{org}/{repo}/issues
+            c.update(
+                r#"
+                  CREATE FOREIGN TABLE openapi_issues (
+                    id bigint,
+                    org text,
+                    repo text,
+                    title text,
+                    state text,
+                    attrs jsonb
+                  )
+                  SERVER openapi_server
+                  OPTIONS (
+                    endpoint '/projects/{org}/{repo}/issues',
+                    response_path '/items',
+                    rowid_column 'id'
+                  )
+             "#,
+                None,
+                &[],
+            )
+            .unwrap();
+
+            let results = c
+                .select(
+                    "SELECT org, repo, title FROM openapi_issues WHERE org = 'supabase' AND repo = 'wrappers'",
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .filter_map(|r| r.get_by_name::<&str, _>("org").unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(results, vec!["supabase", "supabase"]);
+
+            // Test GeoJSON FeatureCollection with object_path
+            c.update(
+                r#"
+                  CREATE FOREIGN TABLE openapi_locations (
+                    id text,
+                    name text,
+                    category text,
+                    population bigint,
+                    attrs jsonb
+                  )
+                  SERVER openapi_server
+                  OPTIONS (
+                    endpoint '/locations',
+                    response_path '/features',
+                    object_path '/properties',
+                    rowid_column 'id'
+                  )
+             "#,
+                None,
+                &[],
+            )
+            .unwrap();
+
+            let results = c
+                .select(
+                    "SELECT name, population FROM openapi_locations",
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .filter_map(|r| r.get_by_name::<&str, _>("name").unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(results, vec!["Austin", "Dallas"]);
+
+            // Test direct array response
+            c.update(
+                r#"
+                  CREATE FOREIGN TABLE openapi_tags (
+                    id bigint,
+                    name text,
+                    count bigint,
+                    attrs jsonb
+                  )
+                  SERVER openapi_server
+                  OPTIONS (
+                    endpoint '/tags',
+                    rowid_column 'id'
+                  )
+             "#,
+                None,
+                &[],
+            )
+            .unwrap();
+
+            let results = c
+                .select(
+                    "SELECT name FROM openapi_tags",
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .filter_map(|r| r.get_by_name::<&str, _>("name").unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(results, vec!["rust", "postgres", "wasm"]);
+
+            // Test resource type/id pattern: /resources/{type}/{id}
+            c.update(
+                r#"
+                  CREATE FOREIGN TABLE openapi_resources (
+                    id text,
+                    type text,
+                    name text,
+                    description text,
+                    attrs jsonb
+                  )
+                  SERVER openapi_server
+                  OPTIONS (
+                    endpoint '/resources/{type}/{id}',
+                    rowid_column 'id'
+                  )
+             "#,
+                None,
+                &[],
+            )
+            .unwrap();
+
+            let results = c
+                .select(
+                    "SELECT type, id, name FROM openapi_resources WHERE type = 'document' AND id = 'doc-001'",
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .filter_map(|r| r.get_by_name::<&str, _>("type").unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(results, vec!["document"]);
         });
     }
 }
