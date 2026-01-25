@@ -1,7 +1,10 @@
-//! OpenAPI Foreign Data Wrapper
+//! `OpenAPI` Foreign Data Wrapper
 //!
-//! A generic Wasm FDW that dynamically parses OpenAPI 3.0+ specifications
-//! and exposes API endpoints as PostgreSQL foreign tables.
+//! A generic Wasm FDW that dynamically parses `OpenAPI` 3.0+ specifications
+//! and exposes API endpoints as `PostgreSQL` foreign tables.
+
+// Allow usize->i64 casts for stats (expected to fit on 64-bit systems)
+#![allow(clippy::cast_possible_wrap)]
 
 #[allow(warnings)]
 mod bindings;
@@ -25,7 +28,7 @@ use bindings::{
 use schema::generate_all_tables;
 use spec::OpenApiSpec;
 
-/// The OpenAPI FDW state
+/// The `OpenAPI` FDW state
 #[derive(Debug, Default)]
 struct OpenApiFdw {
     // Configuration from server options
@@ -64,7 +67,7 @@ struct OpenApiFdw {
 ///
 /// This `static mut` is safe because Wasm execution is single-threaded:
 /// - No concurrent access is possible (no data races)
-/// - Initialized once in `host_version_requirement` before any other Guest methods
+/// - Initialized once in `init()` before any scan/modify methods are called
 /// - All access goes through `this_mut()` which returns exclusive `&mut` reference
 static mut INSTANCE: *mut OpenApiFdw = std::ptr::null_mut::<OpenApiFdw>();
 static FDW_NAME: &str = "OpenApiFdw";
@@ -81,16 +84,16 @@ impl OpenApiFdw {
     }
 
     fn this_mut() -> &'static mut Self {
-        // SAFETY: INSTANCE is initialized in host_version_requirement() before
-        // any other Guest trait methods are called. Wasm is single-threaded,
-        // so only one &mut reference exists at a time (no aliasing).
+        // SAFETY: INSTANCE is initialized in init() before any scan/modify
+        // methods are called. Wasm is single-threaded, so only one &mut
+        // reference exists at a time (no aliasing).
         unsafe {
             debug_assert!(!INSTANCE.is_null(), "OpenApiFdw not initialized");
             &mut (*INSTANCE)
         }
     }
 
-    /// Fetch and parse the OpenAPI spec
+    /// Fetch and parse the `OpenAPI` spec
     fn fetch_spec(&mut self) -> Result<(), FdwError> {
         if let Some(ref url) = self.spec_url {
             let req = http::Request {
@@ -149,7 +152,7 @@ impl OpenApiFdw {
     /// - `/resources/{type}/{id}`
     ///
     /// Path parameters are substituted from WHERE clause quals.
-    /// Returns (url, path_params) where path_params maps column names to values.
+    /// Returns (url, `path_params`) where `path_params` maps column names to values.
     fn build_url(
         &self,
         ctx: &Context,
@@ -311,14 +314,14 @@ impl OpenApiFdw {
         if let Some(ref path) = self.response_path {
             let data = resp
                 .pointer(path)
-                .ok_or_else(|| format!("Response path '{}' not found in response", path))?;
+                .ok_or_else(|| format!("Response path '{path}' not found in response"))?;
 
-            return self.json_to_rows(data);
+            return Self::json_to_rows(data);
         }
 
         // Direct array response
         if resp.is_array() {
-            return self.json_to_rows(resp);
+            return Self::json_to_rows(resp);
         }
 
         // Try common wrapper patterns
@@ -326,7 +329,7 @@ impl OpenApiFdw {
             for key in &["data", "results", "items", "records", "entries", "features"] {
                 if let Some(data) = obj.get(*key) {
                     if data.is_array() || data.is_object() {
-                        return self.json_to_rows(data);
+                        return Self::json_to_rows(data);
                     }
                 }
             }
@@ -339,7 +342,7 @@ impl OpenApiFdw {
     }
 
     /// Convert a JSON value to a vector of row objects
-    fn json_to_rows(&self, data: &JsonValue) -> Result<Vec<JsonValue>, FdwError> {
+    fn json_to_rows(data: &JsonValue) -> Result<Vec<JsonValue>, FdwError> {
         if data.is_array() {
             Ok(data.as_array().cloned().unwrap_or_default())
         } else if data.is_object() {
@@ -356,7 +359,7 @@ impl OpenApiFdw {
 
         // Try configured cursor path first
         if !self.cursor_path.is_empty() {
-            if let Some(cursor) = self.extract_non_empty_string(resp, &self.cursor_path) {
+            if let Some(cursor) = Self::extract_non_empty_string(resp, &self.cursor_path) {
                 self.next_cursor = Some(cursor);
                 return;
             }
@@ -376,7 +379,7 @@ impl OpenApiFdw {
             "/_links/next/href",
         ];
         for path in &next_url_paths {
-            if let Some(url) = self.extract_non_empty_string(resp, path) {
+            if let Some(url) = Self::extract_non_empty_string(resp, path) {
                 self.next_url = Some(url);
                 return;
             }
@@ -391,7 +394,7 @@ impl OpenApiFdw {
         let has_more = has_more_paths
             .iter()
             .find_map(|p| resp.pointer(p))
-            .and_then(|v| v.as_bool())
+            .and_then(JsonValue::as_bool)
             .unwrap_or(false);
 
         if !has_more {
@@ -406,7 +409,7 @@ impl OpenApiFdw {
             "/cursor",
         ];
         for path in &cursor_paths {
-            if let Some(cursor) = self.extract_non_empty_string(resp, path) {
+            if let Some(cursor) = Self::extract_non_empty_string(resp, path) {
                 self.next_cursor = Some(cursor);
                 return;
             }
@@ -414,11 +417,11 @@ impl OpenApiFdw {
     }
 
     /// Extract a non-empty string from a JSON pointer path
-    fn extract_non_empty_string(&self, json: &JsonValue, path: &str) -> Option<String> {
+    fn extract_non_empty_string(json: &JsonValue, path: &str) -> Option<String> {
         json.pointer(path)
-            .and_then(|v| v.as_str())
+            .and_then(JsonValue::as_str)
             .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
+            .map(ToString::to_string)
     }
 
     /// Convert a JSON value to a Cell based on the target column type
@@ -468,20 +471,29 @@ impl OpenApiFdw {
         // Type conversion based on target column type
         let cell = match tgt_col.type_oid() {
             TypeOid::Bool => src.as_bool().map(Cell::Bool),
-            TypeOid::I8 => src.as_i64().map(|v| Cell::I8(v as i8)),
-            TypeOid::I16 => src.as_i64().map(|v| Cell::I16(v as i16)),
-            TypeOid::I32 => src.as_i64().map(|v| Cell::I32(v as i32)),
+            TypeOid::I8 => src
+                .as_i64()
+                .and_then(|v| i8::try_from(v).ok())
+                .map(Cell::I8),
+            TypeOid::I16 => src
+                .as_i64()
+                .and_then(|v| i16::try_from(v).ok())
+                .map(Cell::I16),
+            TypeOid::I32 => src
+                .as_i64()
+                .and_then(|v| i32::try_from(v).ok())
+                .map(Cell::I32),
             TypeOid::I64 => src.as_i64().map(Cell::I64),
+            #[allow(clippy::cast_possible_truncation)]
             TypeOid::F32 => src.as_f64().map(|v| Cell::F32(v as f32)),
             TypeOid::F64 => src.as_f64().map(Cell::F64),
             TypeOid::Numeric => src.as_f64().map(Cell::Numeric),
             TypeOid::String => {
                 // Handle both string and non-string JSON values
-                if let Some(s) = src.as_str() {
-                    Some(Cell::String(s.to_owned()))
-                } else {
-                    Some(Cell::String(src.to_string()))
-                }
+                Some(Cell::String(
+                    src.as_str()
+                        .map_or_else(|| src.to_string(), ToOwned::to_owned),
+                ))
             }
             TypeOid::Date => {
                 if let Some(s) = src.as_str() {
@@ -507,16 +519,16 @@ impl OpenApiFdw {
                     None
                 }
             }
-            TypeOid::Json => Some(Cell::Json(src.to_string())),
             TypeOid::Uuid => src.as_str().map(|v| Cell::String(v.to_owned())),
-            _ => Some(Cell::Json(src.to_string())),
+            // Json and unknown types: serialize to JSON string
+            TypeOid::Json | TypeOid::Other(_) => Some(Cell::Json(src.to_string())),
         };
 
         Ok(cell)
     }
 }
 
-/// Convert snake_case to camelCase
+/// Convert `snake_case` to `camelCase`
 fn to_camel_case(s: &str) -> String {
     let mut result = String::new();
     let mut capitalize_next = false;
@@ -563,12 +575,12 @@ impl Guest for OpenApiFdw {
         // Optional User-Agent header (some APIs require this for identification)
         if let Some(user_agent) = opts.get("user_agent") {
             this.headers
-                .push(("user-agent".to_owned(), user_agent.to_string()));
+                .push(("user-agent".to_owned(), user_agent));
         }
 
         // Optional Accept header for content negotiation (JSON, XML, JSON-LD, GeoJSON etc.)
         if let Some(accept) = opts.get("accept") {
-            this.headers.push(("accept".to_owned(), accept.to_string()));
+            this.headers.push(("accept".to_owned(), accept));
         }
 
         // Custom headers as JSON object: '{"Feature-Flags": "value", "X-Custom": "value"}'
@@ -593,9 +605,8 @@ impl Guest for OpenApiFdw {
             let prefix = opts.get("api_key_prefix");
 
             let header_value = match (header_name.as_str(), prefix) {
-                ("Authorization", None) => format!("Bearer {}", key),
-                ("Authorization", Some(p)) => format!("{} {}", p, key),
-                (_, Some(p)) => format!("{} {}", p, key),
+                ("Authorization", None) => format!("Bearer {key}"),
+                (_, Some(p)) => format!("{p} {key}"),
                 (_, None) => key,
             };
 
@@ -611,7 +622,7 @@ impl Guest for OpenApiFdw {
 
         if let Some(token) = bearer_token {
             this.headers
-                .push(("authorization".to_owned(), format!("Bearer {}", token)));
+                .push(("authorization".to_owned(), format!("Bearer {token}")));
         }
 
         // Pagination defaults (page_size=0 means no automatic limit parameter)
@@ -684,11 +695,10 @@ impl Guest for OpenApiFdw {
 
         // Convert current row (apply object_path if set, e.g., "/properties" for GeoJSON)
         let src_row = &this.src_rows[this.src_idx];
-        let effective_row = if let Some(ref path) = this.object_path {
-            src_row.pointer(path).unwrap_or(src_row)
-        } else {
-            src_row
-        };
+        let effective_row = this
+            .object_path
+            .as_ref()
+            .map_or(src_row, |path| src_row.pointer(path).unwrap_or(src_row));
         for tgt_col in ctx.get_columns() {
             let cell = this.json_to_cell(effective_row, &tgt_col)?;
             row.push(cell.as_ref());

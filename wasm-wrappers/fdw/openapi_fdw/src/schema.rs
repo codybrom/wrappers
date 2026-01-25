@@ -1,11 +1,11 @@
-//! Schema generation and type mapping for OpenAPI FDW
+//! Schema generation and type mapping for `OpenAPI` FDW
 //!
-//! This module handles mapping OpenAPI types to PostgreSQL types
+//! This module handles mapping `OpenAPI` types to `PostgreSQL` types
 //! and generating CREATE FOREIGN TABLE statements.
 
 use crate::spec::{EndpointInfo, OpenApiSpec, Schema};
 
-/// Maps OpenAPI schema types to PostgreSQL type names
+/// Maps `OpenAPI` schema types to `PostgreSQL` type names
 pub fn openapi_to_pg_type(schema: &Schema, spec: &OpenApiSpec) -> &'static str {
     // First resolve the schema if it's a reference
     let resolved = if schema.reference.is_some() {
@@ -18,26 +18,22 @@ pub fn openapi_to_pg_type(schema: &Schema, spec: &OpenApiSpec) -> &'static str {
         Some("string") => match resolved.format.as_deref() {
             Some("date") => "date",
             Some("date-time") => "timestamptz",
-            Some("uuid") => "text", // Could use uuid type, but text is safer
-            Some("uri") | Some("url") => "text",
-            Some("email") => "text",
-            Some("binary") | Some("byte") => "text",
+            // All other string formats map to text
             _ => "text",
         },
         Some("integer") => match resolved.format.as_deref() {
             Some("int32") => "integer",
-            Some("int64") => "bigint",
-            _ => "bigint", // Default to bigint for safety
+            // int64 and others default to bigint for safety
+            _ => "bigint",
         },
         Some("number") => match resolved.format.as_deref() {
             Some("float") => "real",
-            Some("double") => "double precision",
-            _ => "double precision", // Default to double precision
+            // double and others default to double precision
+            _ => "double precision",
         },
         Some("boolean") => "boolean",
-        Some("array") => "jsonb",
-        Some("object") => "jsonb",
-        None | Some(_) => "jsonb", // Default to jsonb for unknown/complex types
+        // array, object, and unknown types default to jsonb
+        _ => "jsonb",
     }
 }
 
@@ -49,7 +45,7 @@ pub struct ColumnDef {
     pub nullable: bool,
 }
 
-/// Extract column definitions from an OpenAPI response schema
+/// Extract column definitions from an `OpenAPI` response schema
 pub fn extract_columns(schema: &Schema, spec: &OpenApiSpec) -> Vec<ColumnDef> {
     let mut columns = Vec::new();
 
@@ -96,7 +92,7 @@ pub fn extract_columns(schema: &Schema, spec: &OpenApiSpec) -> Vec<ColumnDef> {
     columns
 }
 
-/// Sanitize a column name for PostgreSQL (converts camelCase to snake_case)
+/// Sanitize a column name for `PostgreSQL` (converts `camelCase` to `snake_case`)
 fn sanitize_column_name(name: &str) -> String {
     let mut result = String::new();
 
@@ -127,23 +123,24 @@ pub fn generate_foreign_table(
 ) -> String {
     let table_name = endpoint.table_name();
 
-    let columns = if let Some(ref schema) = endpoint.response_schema {
-        extract_columns(schema, spec)
-    } else {
-        // Default columns if no schema is available
-        vec![
-            ColumnDef {
-                name: "id".to_string(),
-                pg_type: "text",
-                nullable: false,
-            },
-            ColumnDef {
-                name: "attrs".to_string(),
-                pg_type: "jsonb",
-                nullable: true,
-            },
-        ]
-    };
+    let columns = endpoint.response_schema.as_ref().map_or_else(
+        || {
+            // Default columns if no schema is available
+            vec![
+                ColumnDef {
+                    name: "id".to_string(),
+                    pg_type: "text",
+                    nullable: false,
+                },
+                ColumnDef {
+                    name: "attrs".to_string(),
+                    pg_type: "jsonb",
+                    nullable: true,
+                },
+            ]
+        },
+        |schema| extract_columns(schema, spec),
+    );
 
     let column_defs: Vec<String> = columns
         .iter()
@@ -157,17 +154,16 @@ pub fn generate_foreign_table(
     let rowid_col = columns
         .iter()
         .find(|c| c.name == "id")
-        .map(|c| c.name.as_str())
-        .unwrap_or("attrs");
+        .map_or("attrs", |c| c.name.as_str());
 
     format!(
-        r#"CREATE FOREIGN TABLE IF NOT EXISTS {} (
+        r"CREATE FOREIGN TABLE IF NOT EXISTS {} (
 {}
 )
 SERVER {} OPTIONS (
     endpoint '{}',
     rowid_column '{}'
-)"#,
+)",
         table_name,
         column_defs.join(",\n"),
         server_name,

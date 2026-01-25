@@ -1,13 +1,13 @@
-//! OpenAPI 3.0+ specification parsing
+//! `OpenAPI` 3.0+ specification parsing
 //!
-//! This module provides types and functions for parsing OpenAPI specifications
+//! This module provides types and functions for parsing `OpenAPI` specifications
 //! and extracting endpoint/schema information for FDW table generation.
 
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 
-/// Represents an OpenAPI 3.0+ specification
+/// Represents an `OpenAPI` 3.0+ specification
 #[derive(Debug, Deserialize)]
 pub struct OpenApiSpec {
     #[allow(dead_code)] // Required by OpenAPI spec format, validated by serde
@@ -64,6 +64,7 @@ pub struct MediaType {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
+#[allow(clippy::struct_field_names)]
 pub struct Schema {
     #[serde(rename = "type")]
     #[serde(default)]
@@ -71,9 +72,9 @@ pub struct Schema {
     #[serde(default)]
     pub format: Option<String>,
     #[serde(default)]
-    pub properties: HashMap<String, Schema>,
+    pub properties: HashMap<String, Self>,
     #[serde(default)]
-    pub items: Option<Box<Schema>>,
+    pub items: Option<Box<Self>>,
     #[serde(rename = "$ref")]
     #[serde(default)]
     pub reference: Option<String>,
@@ -83,13 +84,13 @@ pub struct Schema {
     pub nullable: bool,
     #[serde(rename = "allOf")]
     #[serde(default)]
-    pub all_of: Vec<Schema>,
+    pub all_of: Vec<Self>,
     #[serde(rename = "oneOf")]
     #[serde(default)]
-    pub one_of: Vec<Schema>,
+    pub one_of: Vec<Self>,
     #[serde(rename = "anyOf")]
     #[serde(default)]
-    pub any_of: Vec<Schema>,
+    pub any_of: Vec<Self>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -99,15 +100,15 @@ pub struct Components {
 }
 
 impl OpenApiSpec {
-    /// Parse an OpenAPI spec from a JSON value
+    /// Parse an `OpenAPI` spec from a JSON value
     pub fn from_json(json: &JsonValue) -> Result<Self, String> {
-        serde_json::from_value(json.clone()).map_err(|e| format!("Failed to parse OpenAPI spec: {}", e))
+        serde_json::from_value(json.clone()).map_err(|e| format!("Failed to parse OpenAPI spec: {e}"))
     }
 
-    /// Parse an OpenAPI spec from a JSON string (used in tests)
+    /// Parse an `OpenAPI` spec from a JSON string (used in tests)
     #[cfg(test)]
     pub fn from_str(s: &str) -> Result<Self, String> {
-        serde_json::from_str(s).map_err(|e| format!("Failed to parse OpenAPI spec: {}", e))
+        serde_json::from_str(s).map_err(|e| format!("Failed to parse OpenAPI spec: {e}"))
     }
 
     /// Get the base URL from the spec (first server URL)
@@ -127,7 +128,7 @@ impl OpenApiSpec {
             }
 
             if let Some(ref op) = path_item.get {
-                let response_schema = self.get_response_schema(op);
+                let response_schema = Self::get_response_schema(op);
                 endpoints.push(EndpointInfo {
                     path: path.clone(),
                     response_schema,
@@ -140,7 +141,7 @@ impl OpenApiSpec {
     }
 
     /// Get the response schema for a successful response (200, 201, or default)
-    fn get_response_schema(&self, op: &Operation) -> Option<Schema> {
+    fn get_response_schema(op: &Operation) -> Option<Schema> {
         let response = op
             .responses
             .get("200")
@@ -166,36 +167,55 @@ impl OpenApiSpec {
         }
     }
 
-    /// Recursively resolve a schema, following $ref pointers and handling composition
+    /// Recursively resolve a schema, following $ref pointers and handling composition.
+    /// Uses depth limiting to prevent infinite recursion on circular references.
     pub fn resolve_schema(&self, schema: &Schema) -> Schema {
+        self.resolve_schema_with_depth(schema, 0)
+    }
+
+    /// Maximum depth for schema resolution to prevent stack overflow on circular refs
+    const MAX_RESOLVE_DEPTH: usize = 32;
+
+    /// Internal schema resolution with depth tracking
+    fn resolve_schema_with_depth(&self, schema: &Schema, depth: usize) -> Schema {
+        // Guard against circular references
+        if depth > Self::MAX_RESOLVE_DEPTH {
+            return schema.clone();
+        }
+
         // First resolve any $ref
         if let Some(ref reference) = schema.reference {
             if let Some(resolved) = self.resolve_ref(reference) {
-                return self.resolve_schema(resolved);
+                return self.resolve_schema_with_depth(resolved, depth + 1);
             }
         }
 
         // Handle allOf by merging all properties (intersection - all schemas apply)
         if !schema.all_of.is_empty() {
-            return self.merge_schemas(&schema.all_of, false);
+            return self.merge_schemas_with_depth(&schema.all_of, false, depth + 1);
         }
 
         // Handle oneOf by merging all possible properties as nullable (union - one of the schemas)
         if !schema.one_of.is_empty() {
-            return self.merge_schemas(&schema.one_of, true);
+            return self.merge_schemas_with_depth(&schema.one_of, true, depth + 1);
         }
 
         // Handle anyOf by merging all possible properties as nullable (union - any of the schemas)
         if !schema.any_of.is_empty() {
-            return self.merge_schemas(&schema.any_of, true);
+            return self.merge_schemas_with_depth(&schema.any_of, true, depth + 1);
         }
 
         schema.clone()
     }
 
-    /// Merge multiple schemas into one
+    /// Merge multiple schemas into one with depth tracking.
     /// If `make_nullable` is true, all properties become optional (for oneOf/anyOf)
-    fn merge_schemas(&self, schemas: &[Schema], make_nullable: bool) -> Schema {
+    fn merge_schemas_with_depth(
+        &self,
+        schemas: &[Schema],
+        make_nullable: bool,
+        depth: usize,
+    ) -> Schema {
         let mut merged = Schema {
             schema_type: Some("object".to_string()),
             properties: HashMap::new(),
@@ -204,7 +224,7 @@ impl OpenApiSpec {
         };
 
         for sub_schema in schemas {
-            let resolved = self.resolve_schema(sub_schema);
+            let resolved = self.resolve_schema_with_depth(sub_schema, depth);
 
             // Merge properties
             for (name, mut prop_schema) in resolved.properties {
