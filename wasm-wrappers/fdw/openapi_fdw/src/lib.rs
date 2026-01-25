@@ -144,9 +144,9 @@ impl OpenApiFdw {
     /// Build the URL for a request, handling path parameters and pagination
     ///
     /// Supports endpoint templates like:
-    /// - `/stations/{station_id}/observations`
-    /// - `/gridpoints/{wfo}/{x},{y}/forecast`
-    /// - `/zones/{type}/{zone_id}`
+    /// - `/users/{user_id}/posts`
+    /// - `/projects/{org}/{repo}/issues`
+    /// - `/resources/{type}/{id}`
     ///
     /// Path parameters are substituted from WHERE clause quals.
     /// Returns (url, path_params) where path_params maps column names to values.
@@ -175,7 +175,7 @@ impl OpenApiFdw {
         }
 
         // Substitute path parameters in endpoint template
-        // e.g., /stations/{station_id}/observations -> /stations/KAUS/observations
+        // e.g., /users/{user_id}/posts -> /users/123/posts
         let mut endpoint = self.endpoint.clone();
         let mut path_params_used: Vec<String> = Vec::new();
 
