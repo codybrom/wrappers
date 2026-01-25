@@ -37,7 +37,7 @@ struct OpenApiFdw {
     // Current operation state (from table options)
     endpoint: String,
     response_path: Option<String>,
-    object_path: Option<String>,  // Extract nested object from each row (e.g., "/properties" for GeoJSON)
+    object_path: Option<String>, // Extract nested object from each row (e.g., "/properties" for GeoJSON)
     rowid_col: String,
 
     // Pagination configuration
@@ -322,7 +322,11 @@ impl OpenApiFdw {
     }
 
     /// Convert a JSON value to a Cell based on the target column type
-    fn json_to_cell(&self, src_row: &JsonValue, tgt_col: &Column) -> Result<Option<Cell>, FdwError> {
+    fn json_to_cell(
+        &self,
+        src_row: &JsonValue,
+        tgt_col: &Column,
+    ) -> Result<Option<Cell>, FdwError> {
         let tgt_col_name = tgt_col.name();
 
         // Special handling for 'attrs' column - returns entire row as JSON
@@ -431,9 +435,7 @@ impl OpenApiFdw {
                         .map(JsonValue::Number)
                         .unwrap_or(JsonValue::Null),
                     Cell::String(v) => JsonValue::String(v.clone()),
-                    Cell::Date(v) => {
-                        JsonValue::String(time::epoch_ms_to_rfc3339(v * 1_000_000)?)
-                    }
+                    Cell::Date(v) => JsonValue::String(time::epoch_ms_to_rfc3339(v * 1_000_000)?),
                     Cell::Timestamp(v) | Cell::Timestamptz(v) => {
                         JsonValue::String(time::epoch_ms_to_rfc3339(*v)?)
                     }
@@ -499,10 +501,31 @@ impl Guest for OpenApiFdw {
         // Get spec_url for import_foreign_schema
         this.spec_url = opts.get("spec_url");
 
-        // Set up authentication headers
-        this.headers.push(("user-agent".to_owned(), "Wrappers OpenAPI FDW".to_string()));
-        this.headers.push(("content-type".to_owned(), "application/json".to_string()));
-        this.headers.push(("accept".to_owned(), "application/json".to_string()));
+        // Set up headers
+        this.headers
+            .push(("content-type".to_owned(), "application/json".to_string()));
+
+        // Optional User-Agent header (some APIs require this for identification)
+        if let Some(user_agent) = opts.get("user_agent") {
+            this.headers
+                .push(("user-agent".to_owned(), user_agent.to_string()));
+        }
+
+        // Optional Accept header for content negotiation (JSON, XML, JSON-LD, GeoJSON etc.)
+        if let Some(accept) = opts.get("accept") {
+            this.headers.push(("accept".to_owned(), accept.to_string()));
+        }
+
+        // Custom headers as JSON object: '{"Feature-Flags": "value", "X-Custom": "value"}'
+        if let Some(headers_json) = opts.get("headers") {
+            if let Ok(headers) = serde_json::from_str::<JsonMap<String, JsonValue>>(&headers_json) {
+                for (key, value) in headers {
+                    if let Some(v) = value.as_str() {
+                        this.headers.push((key.to_lowercase(), v.to_string()));
+                    }
+                }
+            }
+        }
 
         // API Key authentication
         let api_key = opts.get("api_key").or_else(|| {
@@ -521,7 +544,8 @@ impl Guest for OpenApiFdw {
                 (_, None) => key,
             };
 
-            this.headers.push((header_name.to_lowercase(), header_value));
+            this.headers
+                .push((header_name.to_lowercase(), header_value));
         }
 
         // Bearer token authentication (alternative to api_key)
@@ -557,7 +581,7 @@ impl Guest for OpenApiFdw {
         this.endpoint = opts.require("endpoint")?;
         this.rowid_col = opts.require_or("rowid_column", "id");
         this.response_path = opts.get("response_path");
-        this.object_path = opts.get("object_path");  // e.g., "/properties" for GeoJSON
+        this.object_path = opts.get("object_path"); // e.g., "/properties" for GeoJSON
         this.cursor_path = opts.require_or("cursor_path", "");
 
         // Override pagination params if specified at table level

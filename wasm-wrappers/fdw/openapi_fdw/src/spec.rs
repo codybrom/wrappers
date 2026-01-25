@@ -63,7 +63,7 @@ pub struct MediaType {
     pub schema: Option<Schema>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct Schema {
     #[serde(rename = "type")]
     #[serde(default)]
@@ -230,22 +230,6 @@ impl OpenApiSpec {
     }
 }
 
-impl Default for Schema {
-    fn default() -> Self {
-        Schema {
-            schema_type: None,
-            format: None,
-            properties: HashMap::new(),
-            items: None,
-            reference: None,
-            required: Vec::new(),
-            nullable: false,
-            all_of: Vec::new(),
-            one_of: Vec::new(),
-            any_of: Vec::new(),
-        }
-    }
-}
 
 /// Extracted endpoint information for table generation
 #[derive(Debug)]
@@ -262,7 +246,7 @@ impl EndpointInfo {
             .path
             .trim_start_matches('/')
             .split('/')
-            .last()
+            .next_back()
             .unwrap_or("unknown");
 
         // Convert kebab-case to snake_case
