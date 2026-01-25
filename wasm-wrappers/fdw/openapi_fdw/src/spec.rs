@@ -10,8 +10,10 @@ use std::collections::HashMap;
 /// Represents an OpenAPI 3.0+ specification
 #[derive(Debug, Deserialize)]
 pub struct OpenApiSpec {
-    pub openapi: String,
-    pub info: Info,
+    #[allow(dead_code)] // Required by OpenAPI spec format, validated by serde
+    openapi: String,
+    #[allow(dead_code)] // Required by OpenAPI spec format
+    info: Info,
     #[serde(default)]
     pub servers: Vec<Server>,
     #[serde(default)]
@@ -20,80 +22,37 @@ pub struct OpenApiSpec {
     pub components: Option<Components>,
 }
 
+/// API metadata (required by OpenAPI spec format)
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
-pub struct Info {
-    pub title: String,
-    #[serde(default)]
-    pub version: String,
+struct Info {
+    title: String,
 }
 
+/// Server definition - only URL is used
 #[derive(Debug, Deserialize)]
 pub struct Server {
     pub url: String,
-    #[serde(default)]
-    pub description: Option<String>,
 }
 
+/// Path item - only GET operations are used for foreign tables
 #[derive(Debug, Deserialize)]
 pub struct PathItem {
     #[serde(default)]
     pub get: Option<Operation>,
-    #[serde(default)]
-    pub post: Option<Operation>,
-    #[serde(default)]
-    pub put: Option<Operation>,
-    #[serde(default)]
-    pub patch: Option<Operation>,
-    #[serde(default)]
-    pub delete: Option<Operation>,
-    #[serde(default)]
-    pub parameters: Vec<Parameter>,
 }
 
+/// Operation - only responses are used for schema extraction
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Operation {
     #[serde(default)]
-    pub operation_id: Option<String>,
-    #[serde(default)]
-    pub summary: Option<String>,
-    #[serde(default)]
-    pub description: Option<String>,
-    #[serde(default)]
-    pub parameters: Vec<Parameter>,
-    #[serde(default)]
-    pub request_body: Option<RequestBody>,
-    #[serde(default)]
     pub responses: HashMap<String, Response>,
-    #[serde(default)]
-    pub tags: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct Parameter {
-    pub name: String,
-    #[serde(rename = "in")]
-    pub location: String, // "query", "path", "header", "cookie"
-    #[serde(default)]
-    pub required: bool,
-    #[serde(default)]
-    pub schema: Option<Schema>,
-    #[serde(default)]
-    pub description: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct RequestBody {
-    #[serde(default)]
-    pub content: HashMap<String, MediaType>,
-    #[serde(default)]
-    pub required: bool,
-}
-
+/// Response - only content schema is used
 #[derive(Debug, Deserialize)]
 pub struct Response {
-    #[serde(default)]
-    pub description: Option<String>,
     #[serde(default)]
     pub content: HashMap<String, MediaType>,
 }
@@ -137,24 +96,6 @@ pub struct Schema {
 pub struct Components {
     #[serde(default)]
     pub schemas: HashMap<String, Schema>,
-    #[serde(default)]
-    pub security_schemes: HashMap<String, SecurityScheme>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct SecurityScheme {
-    #[serde(rename = "type")]
-    pub scheme_type: String,
-    #[serde(default)]
-    pub scheme: Option<String>,
-    #[serde(default)]
-    pub name: Option<String>,
-    #[serde(rename = "in")]
-    #[serde(default)]
-    pub location: Option<String>,
-    #[serde(rename = "bearerFormat")]
-    #[serde(default)]
-    pub bearer_format: Option<String>,
 }
 
 impl OpenApiSpec {
@@ -163,7 +104,8 @@ impl OpenApiSpec {
         serde_json::from_value(json.clone()).map_err(|e| format!("Failed to parse OpenAPI spec: {}", e))
     }
 
-    /// Parse an OpenAPI spec from a JSON string
+    /// Parse an OpenAPI spec from a JSON string (used in tests)
+    #[cfg(test)]
     pub fn from_str(s: &str) -> Result<Self, String> {
         serde_json::from_str(s).map_err(|e| format!("Failed to parse OpenAPI spec: {}", e))
     }
@@ -188,30 +130,13 @@ impl OpenApiSpec {
                 let response_schema = self.get_response_schema(op);
                 endpoints.push(EndpointInfo {
                     path: path.clone(),
-                    operation_id: op.operation_id.clone(),
-                    summary: op.summary.clone().or_else(|| op.description.clone()),
                     response_schema,
-                    supports_post: path_item.post.is_some(),
-                    supports_patch: path_item.patch.is_some(),
-                    supports_delete: path_item.delete.is_some(),
-                    parameters: Self::merge_parameters(&path_item.parameters, &op.parameters),
                 });
             }
         }
 
         endpoints.sort_by(|a, b| a.path.cmp(&b.path));
         endpoints
-    }
-
-    /// Merge path-level and operation-level parameters
-    fn merge_parameters(path_params: &[Parameter], op_params: &[Parameter]) -> Vec<Parameter> {
-        let mut params: Vec<Parameter> = path_params.iter().cloned().collect();
-        for op_param in op_params {
-            if !params.iter().any(|p| p.name == op_param.name && p.location == op_param.location) {
-                params.push(op_param.clone());
-            }
-        }
-        params
     }
 
     /// Get the response schema for a successful response (200, 201, or default)
@@ -322,29 +247,11 @@ impl Default for Schema {
     }
 }
 
-impl Clone for Parameter {
-    fn clone(&self) -> Self {
-        Parameter {
-            name: self.name.clone(),
-            location: self.location.clone(),
-            required: self.required,
-            schema: self.schema.clone(),
-            description: self.description.clone(),
-        }
-    }
-}
-
 /// Extracted endpoint information for table generation
 #[derive(Debug)]
 pub struct EndpointInfo {
     pub path: String,
-    pub operation_id: Option<String>,
-    pub summary: Option<String>,
     pub response_schema: Option<Schema>,
-    pub supports_post: bool,
-    pub supports_patch: bool,
-    pub supports_delete: bool,
-    pub parameters: Vec<Parameter>,
 }
 
 impl EndpointInfo {
@@ -384,13 +291,7 @@ mod tests {
     fn test_endpoint_table_name() {
         let endpoint = EndpointInfo {
             path: "/api/v1/user-accounts".to_string(),
-            operation_id: None,
-            summary: None,
             response_schema: None,
-            supports_post: false,
-            supports_patch: false,
-            supports_delete: false,
-            parameters: vec![],
         };
 
         assert_eq!(endpoint.table_name(), "user_accounts");

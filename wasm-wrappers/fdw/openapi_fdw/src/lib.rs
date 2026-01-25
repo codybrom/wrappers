@@ -37,12 +37,14 @@ struct OpenApiFdw {
     // Current operation state (from table options)
     endpoint: String,
     response_path: Option<String>,
+    object_path: Option<String>,  // Extract nested object from each row (e.g., "/properties" for GeoJSON)
     rowid_col: String,
 
     // Pagination configuration
     cursor_param: String,
     cursor_path: String,
     page_size: usize,
+    page_size_param: String,
 
     // Pagination state
     next_cursor: Option<String>,
@@ -103,9 +105,9 @@ impl OpenApiFdw {
     fn build_url(&self, ctx: &Context) -> String {
         let quals = ctx.get_quals();
 
-        // Check for ID pushdown (WHERE id = 'x')
+        // Check for ID pushdown (WHERE id = 'x') - case insensitive comparison
         let id_pushdown = quals.iter().find(|q| {
-            q.field() == self.rowid_col && q.operator() == "="
+            q.field().to_lowercase() == self.rowid_col.to_lowercase() && q.operator() == "="
         });
 
         if let Some(id_qual) = id_pushdown {
@@ -129,8 +131,8 @@ impl OpenApiFdw {
             }
 
             // Add page size if configured
-            if self.page_size > 0 {
-                params.push(format!("per_page={}", self.page_size));
+            if self.page_size > 0 && !self.page_size_param.is_empty() {
+                params.push(format!("{}={}", self.page_size_param, self.page_size));
             }
 
             // Add query params from quals (for supported fields)
@@ -229,8 +231,8 @@ impl OpenApiFdw {
 
         // 2. Common wrapper patterns
         if let Some(obj) = resp.as_object() {
-            // Try common data field names
-            for key in &["data", "results", "items", "records", "entries"] {
+            // Try common data field names (including GeoJSON features)
+            for key in &["data", "results", "items", "records", "entries", "features"] {
                 if let Some(data) = obj.get(*key) {
                     if data.is_array() {
                         return Ok(data.as_array().cloned().unwrap_or_default());
@@ -322,13 +324,22 @@ impl OpenApiFdw {
             return Ok(Some(Cell::Json(src_row.to_string())));
         }
 
-        // Handle snake_case column names that might be camelCase in JSON
+        // Handle column name matching with multiple strategies:
+        // 1. Exact match
+        // 2. snake_case to camelCase conversion
+        // 3. Case-insensitive match (PostgreSQL lowercases column names)
         let src = src_row.as_object().and_then(|obj| {
             obj.get(&tgt_col_name)
                 .or_else(|| {
-                    // Try camelCase version
+                    // Try camelCase version (snake_case to camelCase)
                     let camel = to_camel_case(&tgt_col_name);
                     obj.get(&camel)
+                })
+                .or_else(|| {
+                    // Case-insensitive match for when PostgreSQL lowercases column names
+                    obj.iter()
+                        .find(|(k, _)| k.to_lowercase() == tgt_col_name.to_lowercase())
+                        .map(|(_, v)| v)
                 })
         });
 
@@ -514,6 +525,7 @@ impl Guest for OpenApiFdw {
             .and_then(|s| s.parse().ok())
             .unwrap_or(100);
 
+        this.page_size_param = opts.require_or("page_size_param", "limit");
         this.cursor_param = opts.require_or("cursor_param", "after");
 
         stats::inc_stats(FDW_NAME, stats::Metric::CreateTimes, 1);
@@ -529,11 +541,18 @@ impl Guest for OpenApiFdw {
         this.endpoint = opts.require("endpoint")?;
         this.rowid_col = opts.require_or("rowid_column", "id");
         this.response_path = opts.get("response_path");
+        this.object_path = opts.get("object_path");  // e.g., "/properties" for GeoJSON
         this.cursor_path = opts.require_or("cursor_path", "");
 
-        // Override cursor_param if specified at table level
+        // Override pagination params if specified at table level
         if let Some(param) = opts.get("cursor_param") {
             this.cursor_param = param;
+        }
+        if let Some(param) = opts.get("page_size_param") {
+            this.page_size_param = param;
+        }
+        if let Some(size) = opts.get("page_size") {
+            this.page_size = size.parse().unwrap_or(this.page_size);
         }
 
         // Reset pagination state
@@ -568,10 +587,15 @@ impl Guest for OpenApiFdw {
             }
         }
 
-        // Convert current row
+        // Convert current row (apply object_path if set, e.g., "/properties" for GeoJSON)
         let src_row = &this.src_rows[this.src_idx];
+        let effective_row = if let Some(ref path) = this.object_path {
+            src_row.pointer(path).unwrap_or(src_row)
+        } else {
+            src_row
+        };
         for tgt_col in ctx.get_columns() {
-            let cell = this.json_to_cell(src_row, &tgt_col)?;
+            let cell = this.json_to_cell(effective_row, &tgt_col)?;
             row.push(cell.as_ref());
         }
 

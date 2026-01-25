@@ -149,7 +149,13 @@ pub fn generate_foreign_table(
 
     let column_defs: Vec<String> = columns
         .iter()
-        .map(|col| format!("    {} {}", col.name, col.pg_type))
+        .map(|col| {
+            if col.nullable {
+                format!("    {} {}", col.name, col.pg_type)
+            } else {
+                format!("    {} {} NOT NULL", col.name, col.pg_type)
+            }
+        })
         .collect();
 
     // Determine rowid_column - prefer 'id' if available
@@ -201,7 +207,6 @@ pub fn generate_all_tables(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
 
     #[test]
     fn test_sanitize_column_name() {
@@ -213,16 +218,11 @@ mod tests {
 
     #[test]
     fn test_openapi_to_pg_type() {
-        let spec = OpenApiSpec {
-            openapi: "3.0.0".to_string(),
-            info: crate::spec::Info {
-                title: "Test".to_string(),
-                version: "1.0".to_string(),
-            },
-            servers: vec![],
-            paths: HashMap::new(),
-            components: None,
-        };
+        let spec = OpenApiSpec::from_str(r#"{
+            "openapi": "3.0.0",
+            "info": {"title": "Test"},
+            "paths": {}
+        }"#).unwrap();
 
         let string_schema = Schema {
             schema_type: Some("string".to_string()),
