@@ -59,6 +59,10 @@ struct OpenApiFdw {
     // Data buffers
     src_rows: Vec<JsonValue>,
     src_idx: usize,
+
+    // Limit pushdown for early pagination stop
+    src_limit: Option<i64>,
+    consumed_row_cnt: i64,
 }
 
 /// Global FDW instance pointer.
@@ -269,7 +273,7 @@ impl OpenApiFdw {
         (base, extracted_params)
     }
 
-    /// Make a request to the API
+    /// Make a request to the API with automatic rate limit handling
     fn make_request(&mut self, ctx: &Context) -> FdwResult {
         let (url, path_params) = self.build_url(ctx);
         self.path_params = path_params;
@@ -281,7 +285,38 @@ impl OpenApiFdw {
             body: String::default(),
         };
 
-        let resp = http::get(&req)?;
+        // Retry loop for rate limiting (HTTP 429)
+        let mut retry_count = 0;
+        const MAX_RETRIES: u32 = 3;
+
+        let resp = loop {
+            let resp = http::get(&req)?;
+
+            // Handle rate limiting (HTTP 429)
+            if resp.status_code == 429 {
+                if retry_count >= MAX_RETRIES {
+                    return Err("API rate limit exceeded after max retries".to_string());
+                }
+
+                // Try to get retry delay from Retry-After header (case-insensitive)
+                let delay_ms = resp
+                    .headers
+                    .iter()
+                    .find(|h| h.0.to_lowercase() == "retry-after")
+                    .and_then(|h| h.1.parse::<u64>().ok())
+                    .map(|secs| secs * 1000)
+                    .unwrap_or_else(|| {
+                        // Exponential backoff: 1s, 2s, 4s
+                        1000 * (1 << retry_count)
+                    });
+
+                time::sleep(delay_ms);
+                retry_count += 1;
+                continue;
+            }
+
+            break resp;
+        };
 
         // Handle 404 as empty result (no matching resource)
         if resp.status_code == 404 {
@@ -565,8 +600,29 @@ impl Guest for OpenApiFdw {
             .trim_end_matches('/')
             .to_string();
 
+        // Validate base_url format if provided
+        if !this.base_url.is_empty()
+            && !this.base_url.starts_with("http://")
+            && !this.base_url.starts_with("https://")
+        {
+            return Err(format!(
+                "Invalid base_url: '{}'. Must start with http:// or https://",
+                this.base_url
+            ));
+        }
+
         // Get spec_url for import_foreign_schema
         this.spec_url = opts.get("spec_url");
+
+        // Validate spec_url format if provided
+        if let Some(ref spec_url) = this.spec_url {
+            if !spec_url.starts_with("http://") && !spec_url.starts_with("https://") {
+                return Err(format!(
+                    "Invalid spec_url: '{}'. Must start with http:// or https://",
+                    spec_url
+                ));
+            }
+        }
 
         // Set up headers
         this.headers
@@ -665,6 +721,11 @@ impl Guest for OpenApiFdw {
         this.next_cursor = None;
         this.next_url = None;
 
+        // Capture limit for early pagination stop
+        // Note: Postgres handles offset locally, so we need offset + count total rows
+        this.src_limit = ctx.get_limit().map(|v| v.offset() + v.count());
+        this.consumed_row_cnt = 0;
+
         // Make initial request
         this.make_request(ctx)?;
 
@@ -682,6 +743,13 @@ impl Guest for OpenApiFdw {
             // No more pages to fetch
             if this.next_cursor.is_none() && this.next_url.is_none() {
                 return Ok(None);
+            }
+
+            // Check if limit is satisfied - stop pagination early
+            if let Some(limit) = this.src_limit {
+                if this.consumed_row_cnt >= limit {
+                    return Ok(None);
+                }
             }
 
             // Fetch next page
@@ -705,6 +773,7 @@ impl Guest for OpenApiFdw {
         }
 
         this.src_idx += 1;
+        this.consumed_row_cnt += 1;
 
         Ok(Some(0))
     }
@@ -713,6 +782,7 @@ impl Guest for OpenApiFdw {
         let this = Self::this_mut();
         this.next_cursor = None;
         this.next_url = None;
+        this.consumed_row_cnt = 0;
         this.make_request(ctx)
     }
 
