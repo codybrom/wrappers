@@ -514,48 +514,6 @@ impl OpenApiFdw {
 
         Ok(cell)
     }
-
-    /// Convert a Row to a JSON body for POST/PATCH requests
-    fn row_to_body(&self, row: &Row) -> Result<String, FdwError> {
-        let mut map = JsonMap::new();
-
-        for (col_name, cell) in row.cols().iter().zip(row.cells().iter()) {
-            // Skip the attrs column and empty cells
-            if col_name == "attrs" {
-                continue;
-            }
-
-            if let Some(cell) = cell {
-                let value = match cell {
-                    Cell::Bool(v) => JsonValue::Bool(*v),
-                    Cell::I8(v) => JsonValue::Number((*v).into()),
-                    Cell::I16(v) => JsonValue::Number((*v).into()),
-                    Cell::I32(v) => JsonValue::Number((*v).into()),
-                    Cell::I64(v) => JsonValue::Number((*v).into()),
-                    Cell::F32(v) => serde_json::Number::from_f64(*v as f64)
-                        .map(JsonValue::Number)
-                        .unwrap_or(JsonValue::Null),
-                    Cell::F64(v) => serde_json::Number::from_f64(*v)
-                        .map(JsonValue::Number)
-                        .unwrap_or(JsonValue::Null),
-                    Cell::Numeric(v) => serde_json::Number::from_f64(*v)
-                        .map(JsonValue::Number)
-                        .unwrap_or(JsonValue::Null),
-                    Cell::String(v) => JsonValue::String(v.clone()),
-                    Cell::Date(v) => JsonValue::String(time::epoch_ms_to_rfc3339(v * 1_000_000)?),
-                    Cell::Timestamp(v) | Cell::Timestamptz(v) => {
-                        JsonValue::String(time::epoch_ms_to_rfc3339(*v)?)
-                    }
-                    Cell::Json(v) => serde_json::from_str(v).unwrap_or(JsonValue::Null),
-                    Cell::Uuid(v) => JsonValue::String(v.clone()),
-                    Cell::Other(v) => JsonValue::String(v.clone()),
-                };
-                map.insert(col_name.clone(), value);
-            }
-        }
-
-        Ok(JsonValue::Object(map).to_string())
-    }
 }
 
 /// Convert snake_case to camelCase
@@ -575,16 +533,6 @@ fn to_camel_case(s: &str) -> String {
     }
 
     result
-}
-
-/// Convert a Cell to its string representation for use in URLs
-fn cell_to_string(cell: Cell) -> Result<String, FdwError> {
-    match cell {
-        Cell::String(s) => Ok(s),
-        Cell::I32(n) => Ok(n.to_string()),
-        Cell::I64(n) => Ok(n.to_string()),
-        _ => Err("Invalid rowid column value type".to_string()),
-    }
 }
 
 impl Guest for OpenApiFdw {
@@ -765,80 +713,24 @@ impl Guest for OpenApiFdw {
         Ok(())
     }
 
-    fn begin_modify(ctx: &Context) -> FdwResult {
-        let this = Self::this_mut();
-        let opts = ctx.get_options(&OptionsType::Table);
-
-        this.endpoint = opts.require("endpoint")?;
-        this.rowid_col = opts.require("rowid_column")?;
-
-        Ok(())
+    fn begin_modify(_ctx: &Context) -> FdwResult {
+        Err("OpenAPI FDW is read-only".to_string())
     }
 
-    fn insert(_ctx: &Context, row: &Row) -> FdwResult {
-        let this = Self::this_mut();
-
-        let url = format!("{}{}", this.base_url, this.endpoint);
-        let body = this.row_to_body(row)?;
-
-        let req = http::Request {
-            method: http::Method::Post,
-            url,
-            headers: this.headers.clone(),
-            body,
-        };
-
-        let resp = http::post(&req)?;
-        http::error_for_status(&resp).map_err(|err| format!("{}: {}", err, resp.body))?;
-
-        stats::inc_stats(FDW_NAME, stats::Metric::RowsOut, 1);
-
-        Ok(())
+    fn insert(_ctx: &Context, _row: &Row) -> FdwResult {
+        Err("OpenAPI FDW is read-only".to_string())
     }
 
-    fn update(_ctx: &Context, rowid: Cell, row: &Row) -> FdwResult {
-        let this = Self::this_mut();
-        let id = cell_to_string(rowid)?;
-        let url = format!("{}{}/{}", this.base_url, this.endpoint, id);
-        let body = this.row_to_body(row)?;
-
-        let req = http::Request {
-            method: http::Method::Patch,
-            url,
-            headers: this.headers.clone(),
-            body,
-        };
-
-        let resp = http::patch(&req)?;
-        http::error_for_status(&resp).map_err(|err| format!("{}: {}", err, resp.body))?;
-
-        stats::inc_stats(FDW_NAME, stats::Metric::RowsOut, 1);
-
-        Ok(())
+    fn update(_ctx: &Context, _rowid: Cell, _row: &Row) -> FdwResult {
+        Err("OpenAPI FDW is read-only".to_string())
     }
 
-    fn delete(_ctx: &Context, rowid: Cell) -> FdwResult {
-        let this = Self::this_mut();
-        let id = cell_to_string(rowid)?;
-        let url = format!("{}{}/{}", this.base_url, this.endpoint, id);
-
-        let req = http::Request {
-            method: http::Method::Delete,
-            url,
-            headers: this.headers.clone(),
-            body: String::default(),
-        };
-
-        let resp = http::delete(&req)?;
-        http::error_for_status(&resp).map_err(|err| format!("{}: {}", err, resp.body))?;
-
-        stats::inc_stats(FDW_NAME, stats::Metric::RowsOut, 1);
-
-        Ok(())
+    fn delete(_ctx: &Context, _rowid: Cell) -> FdwResult {
+        Err("OpenAPI FDW is read-only".to_string())
     }
 
     fn end_modify(_ctx: &Context) -> FdwResult {
-        Ok(())
+        Err("OpenAPI FDW is read-only".to_string())
     }
 
     fn import_foreign_schema(
