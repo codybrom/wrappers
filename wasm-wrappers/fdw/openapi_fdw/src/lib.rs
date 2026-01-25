@@ -58,19 +58,36 @@ struct OpenApiFdw {
     src_idx: usize,
 }
 
+/// Global FDW instance pointer.
+///
+/// # Safety
+///
+/// This `static mut` is safe because Wasm execution is single-threaded:
+/// - No concurrent access is possible (no data races)
+/// - Initialized once in `host_version_requirement` before any other Guest methods
+/// - All access goes through `this_mut()` which returns exclusive `&mut` reference
 static mut INSTANCE: *mut OpenApiFdw = std::ptr::null_mut::<OpenApiFdw>();
 static FDW_NAME: &str = "OpenApiFdw";
 
 impl OpenApiFdw {
     fn init_instance() {
         let instance = Self::default();
+        // SAFETY: Wasm is single-threaded, no concurrent access possible.
+        // Box::leak intentionally leaks memory to create a stable 'static pointer
+        // that lives for the entire FDW lifetime (until Postgres unloads).
         unsafe {
             INSTANCE = Box::leak(Box::new(instance));
         }
     }
 
     fn this_mut() -> &'static mut Self {
-        unsafe { &mut (*INSTANCE) }
+        // SAFETY: INSTANCE is initialized in host_version_requirement() before
+        // any other Guest trait methods are called. Wasm is single-threaded,
+        // so only one &mut reference exists at a time (no aliasing).
+        unsafe {
+            debug_assert!(!INSTANCE.is_null(), "OpenApiFdw not initialized");
+            &mut (*INSTANCE)
+        }
     }
 
     /// Fetch and parse the OpenAPI spec
