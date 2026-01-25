@@ -118,54 +118,53 @@ impl OpenApiFdw {
         }
 
         // Build URL with pagination
-        let url = if let Some(ref next_url) = self.next_url {
-            next_url.clone()
-        } else {
-            let mut base = format!("{}{}", self.base_url, self.endpoint);
+        if let Some(ref next_url) = self.next_url {
+            return next_url.clone();
+        }
 
-            // Add pagination cursor if we have one
-            let mut params = Vec::new();
+        let mut base = format!("{}{}", self.base_url, self.endpoint);
+        let mut params = Vec::new();
 
-            if let Some(ref cursor) = self.next_cursor {
-                params.push(format!("{}={}", self.cursor_param, cursor));
+        // Add pagination cursor if we have one
+        if let Some(ref cursor) = self.next_cursor {
+            params.push(format!("{}={}", self.cursor_param, cursor));
+        }
+
+        // Add page size if configured
+        if self.page_size > 0 && !self.page_size_param.is_empty() {
+            params.push(format!("{}={}", self.page_size_param, self.page_size));
+        }
+
+        // Add query params from quals (for supported fields)
+        for qual in &quals {
+            // Skip the rowid column for list queries
+            if qual.field() == self.rowid_col {
+                continue;
             }
 
-            // Add page size if configured
-            if self.page_size > 0 && !self.page_size_param.is_empty() {
-                params.push(format!("{}={}", self.page_size_param, self.page_size));
+            // Only push down simple equality quals
+            if qual.operator() != "=" {
+                continue;
             }
 
-            // Add query params from quals (for supported fields)
-            for qual in &quals {
-                // Skip the rowid column for list queries
-                if qual.field() == self.rowid_col {
-                    continue;
-                }
-
-                // Only push down simple equality quals
-                if qual.operator() == "=" {
-                    if let Value::Cell(cell) = qual.value() {
-                        let value = match cell {
-                            Cell::String(s) => s,
-                            Cell::I32(n) => n.to_string(),
-                            Cell::I64(n) => n.to_string(),
-                            Cell::Bool(b) => b.to_string(),
-                            _ => continue,
-                        };
-                        params.push(format!("{}={}", qual.field(), value));
-                    }
-                }
+            if let Value::Cell(cell) = qual.value() {
+                let value = match cell {
+                    Cell::String(s) => s,
+                    Cell::I32(n) => n.to_string(),
+                    Cell::I64(n) => n.to_string(),
+                    Cell::Bool(b) => b.to_string(),
+                    _ => continue,
+                };
+                params.push(format!("{}={}", qual.field(), value));
             }
+        }
 
-            if !params.is_empty() {
-                base.push('?');
-                base.push_str(&params.join("&"));
-            }
+        if !params.is_empty() {
+            base.push('?');
+            base.push_str(&params.join("&"));
+        }
 
-            base
-        };
-
-        url
+        base
     }
 
     /// Make a request to the API
@@ -214,30 +213,20 @@ impl OpenApiFdw {
                 .pointer(path)
                 .ok_or_else(|| format!("Response path '{}' not found in response", path))?;
 
-            return if data.is_array() {
-                Ok(data.as_array().cloned().unwrap_or_default())
-            } else if data.is_object() {
-                Ok(vec![data.clone()])
-            } else {
-                Err("Response data is not an array or object".to_string())
-            };
+            return self.json_to_rows(data);
         }
 
-        // Auto-detect: try common patterns
-        // 1. Direct array response
+        // Direct array response
         if resp.is_array() {
-            return Ok(resp.as_array().cloned().unwrap_or_default());
+            return self.json_to_rows(resp);
         }
 
-        // 2. Common wrapper patterns
+        // Try common wrapper patterns
         if let Some(obj) = resp.as_object() {
-            // Try common data field names (including GeoJSON features)
             for key in &["data", "results", "items", "records", "entries", "features"] {
                 if let Some(data) = obj.get(*key) {
-                    if data.is_array() {
-                        return Ok(data.as_array().cloned().unwrap_or_default());
-                    } else if data.is_object() {
-                        return Ok(vec![data.clone()]);
+                    if data.is_array() || data.is_object() {
+                        return self.json_to_rows(data);
                     }
                 }
             }
@@ -249,70 +238,87 @@ impl OpenApiFdw {
         Err("Unable to extract data from response".to_string())
     }
 
+    /// Convert a JSON value to a vector of row objects
+    fn json_to_rows(&self, data: &JsonValue) -> Result<Vec<JsonValue>, FdwError> {
+        if data.is_array() {
+            Ok(data.as_array().cloned().unwrap_or_default())
+        } else if data.is_object() {
+            Ok(vec![data.clone()])
+        } else {
+            Err("Response data is not an array or object".to_string())
+        }
+    }
+
     /// Handle pagination from the response
     fn handle_pagination(&mut self, resp: &JsonValue) {
         self.next_cursor = None;
         self.next_url = None;
 
-        // Try to get pagination cursor from response
+        // Try configured cursor path first
         if !self.cursor_path.is_empty() {
-            if let Some(cursor) = resp.pointer(&self.cursor_path) {
-                if let Some(s) = cursor.as_str() {
-                    if !s.is_empty() {
-                        self.next_cursor = Some(s.to_string());
-                        return;
-                    }
-                }
+            if let Some(cursor) = self.extract_non_empty_string(resp, &self.cursor_path) {
+                self.next_cursor = Some(cursor);
+                return;
             }
         }
 
-        // Try common pagination patterns
-        if resp.as_object().is_some() {
-            // Check for next URL
-            for path in &[
-                "/meta/pagination/next",
-                "/pagination/next",
-                "/links/next",
-                "/next",
-                "/_links/next/href",
-            ] {
-                if let Some(next) = resp.pointer(path) {
-                    if let Some(url) = next.as_str() {
-                        if !url.is_empty() {
-                            self.next_url = Some(url.to_string());
-                            return;
-                        }
-                    }
-                }
-            }
+        // Only try auto-detection for object responses
+        if resp.as_object().is_none() {
+            return;
+        }
 
-            // Check for has_more with cursor
-            let has_more = resp
-                .pointer("/meta/pagination/has_more")
-                .or_else(|| resp.pointer("/has_more"))
-                .or_else(|| resp.pointer("/pagination/has_more"))
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-
-            if has_more {
-                // Try to find next cursor
-                for path in &[
-                    "/meta/pagination/next_cursor",
-                    "/pagination/next_cursor",
-                    "/next_cursor",
-                    "/cursor",
-                ] {
-                    if let Some(cursor) = resp.pointer(path) {
-                        if let Some(s) = cursor.as_str() {
-                            if !s.is_empty() {
-                                self.next_cursor = Some(s.to_string());
-                                return;
-                            }
-                        }
-                    }
-                }
+        // Check for next URL in common locations
+        let next_url_paths = [
+            "/meta/pagination/next",
+            "/pagination/next",
+            "/links/next",
+            "/next",
+            "/_links/next/href",
+        ];
+        for path in &next_url_paths {
+            if let Some(url) = self.extract_non_empty_string(resp, path) {
+                self.next_url = Some(url);
+                return;
             }
         }
+
+        // Check for has_more flag with cursor
+        let has_more_paths = [
+            "/meta/pagination/has_more",
+            "/has_more",
+            "/pagination/has_more",
+        ];
+        let has_more = has_more_paths
+            .iter()
+            .find_map(|p| resp.pointer(p))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        if !has_more {
+            return;
+        }
+
+        // Find next cursor
+        let cursor_paths = [
+            "/meta/pagination/next_cursor",
+            "/pagination/next_cursor",
+            "/next_cursor",
+            "/cursor",
+        ];
+        for path in &cursor_paths {
+            if let Some(cursor) = self.extract_non_empty_string(resp, path) {
+                self.next_cursor = Some(cursor);
+                return;
+            }
+        }
+    }
+
+    /// Extract a non-empty string from a JSON pointer path
+    fn extract_non_empty_string(&self, json: &JsonValue, path: &str) -> Option<String> {
+        json.pointer(path)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
     }
 
     /// Convert a JSON value to a Cell based on the target column type
@@ -460,6 +466,16 @@ fn to_camel_case(s: &str) -> String {
     }
 
     result
+}
+
+/// Convert a Cell to its string representation for use in URLs
+fn cell_to_string(cell: Cell) -> Result<String, FdwError> {
+    match cell {
+        Cell::String(s) => Ok(s),
+        Cell::I32(n) => Ok(n.to_string()),
+        Cell::I64(n) => Ok(n.to_string()),
+        _ => Err("Invalid rowid column value type".to_string()),
+    }
 }
 
 impl Guest for OpenApiFdw {
@@ -651,14 +667,7 @@ impl Guest for OpenApiFdw {
 
     fn update(_ctx: &Context, rowid: Cell, row: &Row) -> FdwResult {
         let this = Self::this_mut();
-
-        let id = match rowid {
-            Cell::String(s) => s,
-            Cell::I32(n) => n.to_string(),
-            Cell::I64(n) => n.to_string(),
-            _ => return Err("Invalid rowid column value type".to_string()),
-        };
-
+        let id = cell_to_string(rowid)?;
         let url = format!("{}{}/{}", this.base_url, this.endpoint, id);
         let body = this.row_to_body(row)?;
 
@@ -679,14 +688,7 @@ impl Guest for OpenApiFdw {
 
     fn delete(_ctx: &Context, rowid: Cell) -> FdwResult {
         let this = Self::this_mut();
-
-        let id = match rowid {
-            Cell::String(s) => s,
-            Cell::I32(n) => n.to_string(),
-            Cell::I64(n) => n.to_string(),
-            _ => return Err("Invalid rowid column value type".to_string()),
-        };
-
+        let id = cell_to_string(rowid)?;
         let url = format!("{}{}/{}", this.base_url, this.endpoint, id);
 
         let req = http::Request {

@@ -80,12 +80,10 @@ pub fn extract_columns(schema: &Schema, spec: &OpenApiSpec) -> Vec<ColumnDef> {
     }
 
     // Sort columns alphabetically, but put 'id' first if present
-    columns.sort_by(|a, b| {
-        match (a.name.as_str(), b.name.as_str()) {
-            ("id", _) => std::cmp::Ordering::Less,
-            (_, "id") => std::cmp::Ordering::Greater,
-            _ => a.name.cmp(&b.name),
-        }
+    columns.sort_by(|a, b| match (a.name.as_str(), b.name.as_str()) {
+        ("id", _) => std::cmp::Ordering::Less,
+        (_, "id") => std::cmp::Ordering::Greater,
+        _ => a.name.cmp(&b.name),
     });
 
     // Always add an 'attrs' column for the full JSON response
@@ -98,24 +96,24 @@ pub fn extract_columns(schema: &Schema, spec: &OpenApiSpec) -> Vec<ColumnDef> {
     columns
 }
 
-/// Sanitize a column name for PostgreSQL
+/// Sanitize a column name for PostgreSQL (converts camelCase to snake_case)
 fn sanitize_column_name(name: &str) -> String {
-    // Convert camelCase to snake_case and replace invalid characters
     let mut result = String::new();
+
     for (i, c) in name.chars().enumerate() {
         if c.is_uppercase() && i > 0 {
             result.push('_');
-            result.push(c.to_lowercase().next().unwrap());
+            result.push(c.to_ascii_lowercase());
         } else if c.is_alphanumeric() || c == '_' {
-            result.push(c.to_lowercase().next().unwrap_or(c));
+            result.push(c.to_ascii_lowercase());
         } else {
             result.push('_');
         }
     }
 
-    // PostgreSQL identifiers can't start with a number
-    if result.chars().next().map(|c| c.is_numeric()).unwrap_or(false) {
-        result = format!("_{}", result);
+    // PostgreSQL identifiers cannot start with a digit
+    if result.starts_with(|c: char| c.is_ascii_digit()) {
+        result.insert(0, '_');
     }
 
     result
@@ -150,11 +148,8 @@ pub fn generate_foreign_table(
     let column_defs: Vec<String> = columns
         .iter()
         .map(|col| {
-            if col.nullable {
-                format!("    {} {}", col.name, col.pg_type)
-            } else {
-                format!("    {} {} NOT NULL", col.name, col.pg_type)
-            }
+            let not_null = if col.nullable { "" } else { " NOT NULL" };
+            format!("    {} {}{}", col.name, col.pg_type, not_null)
         })
         .collect();
 

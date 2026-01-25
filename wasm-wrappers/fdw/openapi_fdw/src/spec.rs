@@ -22,27 +22,27 @@ pub struct OpenApiSpec {
     pub components: Option<Components>,
 }
 
-/// API metadata (required by OpenAPI spec format)
-#[allow(dead_code)]
+/// API metadata
 #[derive(Debug, Deserialize)]
 struct Info {
+    #[allow(dead_code)]
     title: String,
 }
 
-/// Server definition - only URL is used
+/// Server definition
 #[derive(Debug, Deserialize)]
 pub struct Server {
     pub url: String,
 }
 
-/// Path item - only GET operations are used for foreign tables
+/// Path item (only GET operations are used for foreign tables)
 #[derive(Debug, Deserialize)]
 pub struct PathItem {
     #[serde(default)]
     pub get: Option<Operation>,
 }
 
-/// Operation - only responses are used for schema extraction
+/// Operation definition
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Operation {
@@ -50,7 +50,7 @@ pub struct Operation {
     pub responses: HashMap<String, Response>,
 }
 
-/// Response - only content schema is used
+/// Response definition
 #[derive(Debug, Deserialize)]
 pub struct Response {
     #[serde(default)]
