@@ -230,9 +230,14 @@ impl OpenApiSpec {
             for (name, mut prop_schema) in resolved.properties {
                 if make_nullable {
                     prop_schema.nullable = true;
+                    // For oneOf/anyOf: keep first definition (most permissive)
+                    merged.properties.entry(name).or_insert(prop_schema);
+                } else {
+                    // For allOf: later schemas refine/override earlier ones
+                    // This follows OpenAPI semantics where allOf combines schemas
+                    // and later definitions can provide more specific types
+                    merged.properties.insert(name, prop_schema);
                 }
-                // If property already exists, keep the existing one (first wins)
-                merged.properties.entry(name).or_insert(prop_schema);
             }
 
             // For allOf, all required fields stay required
@@ -503,5 +508,60 @@ mod tests {
         // The address property should still have a $ref (we resolve at property level when needed)
         let address_prop = resolved.properties.get("address").unwrap();
         assert!(address_prop.reference.is_some() || !address_prop.properties.is_empty());
+    }
+
+    #[test]
+    fn test_allof_later_schema_overrides_earlier() {
+        // Test that for allOf, later schemas override earlier ones
+        // This is important for inheritance patterns where a child refines a parent's type
+        let spec_json = r##"{
+            "openapi": "3.0.0",
+            "info": {"title": "Test", "version": "1.0"},
+            "paths": {},
+            "components": {
+                "schemas": {
+                    "Base": {
+                        "type": "object",
+                        "properties": {
+                            "status": {"type": "string"},
+                            "id": {"type": "integer"}
+                        }
+                    },
+                    "Refined": {
+                        "allOf": [
+                            {"$ref": "#/components/schemas/Base"},
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "status": {
+                                        "type": "string",
+                                        "format": "enum"
+                                    },
+                                    "extra": {"type": "boolean"}
+                                }
+                            }
+                        ]
+                    }
+                }
+            }
+        }"##;
+
+        let spec = OpenApiSpec::from_str(spec_json).unwrap();
+        let refined = spec.resolve_ref("#/components/schemas/Refined").unwrap();
+        let resolved = spec.resolve_schema(refined);
+
+        // Should have all properties
+        assert!(resolved.properties.contains_key("status"));
+        assert!(resolved.properties.contains_key("id"));
+        assert!(resolved.properties.contains_key("extra"));
+
+        // The 'status' property should be from the later schema (has format: "enum")
+        // The base schema's status has no format, so if we get "enum", the later one won
+        let status_prop = resolved.properties.get("status").unwrap();
+        assert_eq!(
+            status_prop.format,
+            Some("enum".to_string()),
+            "Later allOf schema should override earlier schema's property definition"
+        );
     }
 }

@@ -157,13 +157,16 @@ impl OpenApiFdw {
     ///
     /// Path parameters are substituted from WHERE clause quals.
     /// Returns (url, `path_params`) where `path_params` maps column names to values.
+    ///
+    /// # Errors
+    /// Returns an error if required path parameters are missing from the WHERE clause.
     fn build_url(
         &self,
         ctx: &Context,
-    ) -> (String, std::collections::HashMap<String, String>) {
+    ) -> Result<(String, std::collections::HashMap<String, String>), String> {
         // Use next_url for pagination if available
         if let Some(ref next_url) = self.next_url {
-            return (next_url.clone(), self.path_params.clone());
+            return Ok((next_url.clone(), self.path_params.clone()));
         }
 
         let quals = ctx.get_quals();
@@ -185,6 +188,7 @@ impl OpenApiFdw {
         // e.g., /users/{user_id}/posts -> /users/123/posts
         let mut endpoint = self.endpoint.clone();
         let mut path_params_used: Vec<String> = Vec::new();
+        let mut missing_params: Vec<String> = Vec::new();
 
         // Find all {param} patterns and substitute
         while let Some(start) = endpoint.find('{') {
@@ -208,12 +212,27 @@ impl OpenApiFdw {
                         &endpoint[start + end + 1..]
                     );
                 } else {
-                    // No value for this param - leave as is (will likely cause API error)
-                    break;
+                    // Track missing parameter and remove it from the endpoint to continue
+                    missing_params.push(param_name.to_string());
+                    endpoint = format!("{}{}", &endpoint[..start], &endpoint[start + end + 1..]);
                 }
             } else {
                 break;
             }
+        }
+
+        // Return error if any required path parameters are missing
+        if !missing_params.is_empty() {
+            return Err(format!(
+                "Missing required path parameter(s) in WHERE clause: {}. \
+                 Add WHERE {} to your query.",
+                missing_params.join(", "),
+                missing_params
+                    .iter()
+                    .map(|p| format!("{} = '<value>'", p))
+                    .collect::<Vec<_>>()
+                    .join(" AND ")
+            ));
         }
 
         // Check for rowid pushdown for single-resource access
@@ -225,10 +244,10 @@ impl OpenApiFdw {
                 if let Some(id) = Self::qual_value_to_string(id_qual) {
                     // Store rowid as path param too
                     extracted_params.insert(self.rowid_col.to_lowercase(), id.clone());
-                    return (
+                    return Ok((
                         format!("{}{}/{}", self.base_url, endpoint, id),
                         extracted_params,
-                    );
+                    ));
                 }
             }
         }
@@ -270,12 +289,12 @@ impl OpenApiFdw {
             base.push_str(&params.join("&"));
         }
 
-        (base, extracted_params)
+        Ok((base, extracted_params))
     }
 
     /// Make a request to the API with automatic rate limit handling
     fn make_request(&mut self, ctx: &Context) -> FdwResult {
-        let (url, path_params) = self.build_url(ctx);
+        let (url, path_params) = self.build_url(ctx)?;
         self.path_params = path_params;
 
         let req = http::Request {
@@ -630,8 +649,7 @@ impl Guest for OpenApiFdw {
 
         // Optional User-Agent header (some APIs require this for identification)
         if let Some(user_agent) = opts.get("user_agent") {
-            this.headers
-                .push(("user-agent".to_owned(), user_agent));
+            this.headers.push(("user-agent".to_owned(), user_agent));
         }
 
         // Optional Accept header for content negotiation (JSON, XML, JSON-LD, GeoJSON etc.)
