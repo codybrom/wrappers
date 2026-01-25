@@ -375,6 +375,50 @@ class MockServer(BaseHTTPRequestHandler):
   }
 }
             '''
+        elif fdw == "openapi":
+            # Generic OpenAPI FDW test endpoint
+            if req_path.startswith("/users/user-123"):
+                # Single user by ID pushdown
+                body = '''
+{
+  "id": "user-123",
+  "name": "John Doe",
+  "email": "john@example.com",
+  "created_at": "2024-01-15T10:30:00Z",
+  "active": true
+}
+                '''
+            elif req_path.startswith("/users"):
+                # List users
+                body = '''
+{
+  "data": [
+    {
+      "id": "user-123",
+      "name": "John Doe",
+      "email": "john@example.com",
+      "created_at": "2024-01-15T10:30:00Z",
+      "active": true
+    },
+    {
+      "id": "user-456",
+      "name": "Jane Smith",
+      "email": "jane@example.com",
+      "created_at": "2024-02-20T14:45:00Z",
+      "active": false
+    }
+  ],
+  "meta": {
+    "pagination": {
+      "has_more": false,
+      "next_cursor": null
+    }
+  }
+}
+                '''
+            else:
+                self.send_response(404)
+                return
         else:
             self.send_response(404)
             return

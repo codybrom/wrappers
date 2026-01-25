@@ -522,6 +522,62 @@ mod tests {
                 results,
                 vec!["0xd4e56740f876aef8c010b86a40d5f56745a118d0906a34e69aec8c0db1cb8fa3"]
             );
+
+            // OpenAPI FDW test
+            c.update(
+                r#"CREATE SERVER openapi_server
+                     FOREIGN DATA WRAPPER wasm_wrapper
+                     OPTIONS (
+                       fdw_package_url 'file://../../../wasm-wrappers/fdw/target/wasm32-unknown-unknown/release/openapi_fdw.wasm',
+                       fdw_package_name 'supabase:openapi-fdw',
+                       fdw_package_version '>=0.1.0',
+                       base_url 'http://localhost:8096/openapi',
+                       api_key 'test_key'
+                     )"#,
+                None,
+                &[],
+            )
+            .unwrap();
+            c.update(
+                r#"
+                  CREATE FOREIGN TABLE openapi_users (
+                    id text,
+                    name text,
+                    email text,
+                    created_at timestamptz,
+                    active boolean,
+                    attrs jsonb
+                  )
+                  SERVER openapi_server
+                  OPTIONS (
+                    endpoint '/users',
+                    rowid_column 'id'
+                  )
+             "#,
+                None,
+                &[],
+            )
+            .unwrap();
+
+            // Test list query
+            let results = c
+                .select("SELECT id, name, email FROM openapi_users", None, &[])
+                .unwrap()
+                .filter_map(|r| r.get_by_name::<&str, _>("email").unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(results, vec!["john@example.com", "jane@example.com"]);
+
+            // Test ID pushdown query
+            let results = c
+                .select(
+                    "SELECT name FROM openapi_users WHERE id = 'user-123'",
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .filter_map(|r| r.get_by_name::<&str, _>("name").unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(results, vec!["John Doe"]);
         });
     }
 }
