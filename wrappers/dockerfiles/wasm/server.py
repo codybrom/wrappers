@@ -6,6 +6,10 @@ hostName = "0.0.0.0"
 serverPort = 8096
 test_table = "table-foo"
 
+# Counts POSTs to the openapi /wr_count endpoint so tests can assert the FDW
+# issues exactly one request per inserted row (read back via GET /wr_count).
+wr_post_count = {"n": 0}
+
 
 # mock API server for WASM FDW testing
 #
@@ -22,6 +26,22 @@ class MockServer(BaseHTTPRequestHandler):
         self.send_header("Content-type", "application/json")
         self.end_headers()
         self.wfile.write(bytes(body, "utf-8"))
+
+    def read_json_body(self):
+        length = int(self.headers.get("Content-Length", 0))
+        raw = self.rfile.read(length) if length else b""
+        if not raw:
+            return None
+        try:
+            return json.loads(raw.decode("utf-8"))
+        except ValueError:
+            return None
+
+    def respond(self, status, body):
+        self.send_response(status)
+        self.send_header("Content-type", "application/json")
+        self.end_headers()
+        self.wfile.write(bytes(json.dumps(body), "utf-8"))
 
     def do_GET(self):
         (fdw, req_path) = self.get_fdw_req_path()
@@ -589,6 +609,28 @@ class MockServer(BaseHTTPRequestHandler):
   {"id": 3, "name": "wasm", "count": 42}
 ]
                 """
+            # Write-support test endpoints. The list/single GETs serve the scan
+            # phase of UPDATE/DELETE statements (Postgres scans for matching
+            # rows before calling the modify hooks).
+            elif req_path == "/wr_items" or req_path.startswith("/wr_items?"):
+                body = json.dumps(
+                    [{"id": "i-1", "name": "old", "count": 1, "active": False}]
+                )
+            elif req_path.startswith("/wr_items/"):
+                item_id = req_path.split("/")[2].split("?")[0]
+                body = json.dumps(
+                    {"id": item_id, "name": "old", "count": 1, "active": False}
+                )
+            elif req_path.startswith("/wr_enveloped/"):
+                rec_id = req_path.split("/")[2].split("?")[0]
+                body = json.dumps({"id": rec_id, "stage": "Old", "amount": 100})
+            elif req_path.startswith("/wr_delete/"):
+                rec_id = req_path.split("/")[2].split("?")[0]
+                body = json.dumps({"id": rec_id, "name": "x"})
+            elif req_path == "/wr_count" or req_path.startswith("/wr_count?"):
+                body = json.dumps(
+                    [{"id": "counter", "posts": wr_post_count["n"]}]
+                )
             else:
                 self.send_response(404)
                 return
@@ -853,6 +895,34 @@ class MockServer(BaseHTTPRequestHandler):
   "error": {"code": -32601, "message": "Method not found"}
 }
                 """
+        elif fdw == "openapi":
+            base = req_path.split("?")[0]
+            if base == "/wr_items":
+                # Validate what a type-faithful FDW INSERT must send: no
+                # 'attrs' catch-all, numbers as JSON numbers (not strings).
+                req_body = self.read_json_body()
+                if (
+                    isinstance(req_body, dict)
+                    and "attrs" not in req_body
+                    and isinstance(req_body.get("name", ""), str)
+                    and isinstance(req_body.get("count", 0), int)
+                ):
+                    self.respond(201, {"id": "i-new"})
+                else:
+                    self.respond(422, {"error": "malformed POST body"})
+            elif base == "/wr_count":
+                wr_post_count["n"] += 1
+                self.respond(201, {"id": "c-%d" % wr_post_count["n"]})
+            elif base == "/wr_failcode":
+                # HTTP 200 carrying an in-band failure code: a status check
+                # alone must not treat this as success.
+                self.respond(200, {"code": "FAILED", "message": "record rejected"})
+            elif base == "/wr_multistatus":
+                self.respond(207, {"data": [{"code": "SUCCESS"}, {"code": "FAILED"}]})
+            else:
+                self.send_response(404)
+                self.end_headers()
+            return
         else:
             self.send_response(404)
             return
@@ -860,6 +930,76 @@ class MockServer(BaseHTTPRequestHandler):
         self.response(body)
 
         return
+
+    def do_PATCH(self):
+        (fdw, req_path) = self.get_fdw_req_path()
+
+        if fdw == "openapi" and req_path.startswith("/wr_items/"):
+            # Validate what a type-faithful FDW UPDATE must send: rowid in the
+            # URL (never duplicated in the body), 'attrs' never sent, numbers
+            # as JSON numbers, booleans as JSON booleans.
+            req_body = self.read_json_body()
+            if (
+                isinstance(req_body, dict)
+                and "id" not in req_body
+                and "attrs" not in req_body
+                and isinstance(req_body.get("name", ""), str)
+                and isinstance(req_body.get("count", 0), int)
+                and isinstance(req_body.get("active", True), bool)
+            ):
+                self.respond(200, {"ok": True})
+            else:
+                self.respond(422, {"error": "malformed PATCH body"})
+            return
+
+        self.send_response(404)
+        self.end_headers()
+
+    def do_PUT(self):
+        (fdw, req_path) = self.get_fdw_req_path()
+
+        if fdw == "openapi" and req_path.split("?")[0] == "/wr_enveloped":
+            # Envelope API: PUT to the collection URL with {"data": [{...}]}
+            # and the rowid inside the record. Per-record success/failure is
+            # signalled in the HTTP 200 response body, never the status line.
+            req_body = self.read_json_body()
+            records = req_body.get("data") if isinstance(req_body, dict) else None
+            if (
+                isinstance(records, list)
+                and len(records) == 1
+                and isinstance(records[0], dict)
+                and records[0].get("id") == "e-1"
+                and isinstance(records[0].get("stage", ""), str)
+                and isinstance(records[0].get("amount", 0), (int, float))
+            ):
+                self.respond(200, {"data": [{"code": "SUCCESS", "ids": ["e-1"]}]})
+            else:
+                self.respond(200, {"data": [{"code": "INVALID_DATA"}]})
+            return
+
+        self.send_response(404)
+        self.end_headers()
+
+    def do_DELETE(self):
+        (fdw, req_path) = self.get_fdw_req_path()
+
+        if fdw == "openapi":
+            base = req_path.split("?")[0]
+            if base == "/wr_delete":
+                # Query-param style: DELETE /wr_delete?ids=<id>
+                qs = parse_qs(urlparse(req_path).query)
+                if qs.get("ids") == ["d-1"]:
+                    self.respond(200, {"code": "SUCCESS"})
+                else:
+                    self.respond(200, {"code": "FAILED"})
+                return
+            if base.startswith("/wr_items/"):
+                # URL-path style: DELETE /wr_items/<id>
+                self.respond(200, {"deleted": base.split("/")[2]})
+                return
+
+        self.send_response(404)
+        self.end_headers()
 
 
 if __name__ == "__main__":

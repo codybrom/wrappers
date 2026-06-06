@@ -837,4 +837,425 @@ mod tests {
             assert_eq!(injected, vec!["Bearer sess-secret-123"]);
         });
     }
+
+    // Create the wasm FDW handler and an OpenAPI server pointing at the mock
+    // server's write-support endpoints. Used by the openapi_write_* tests.
+    fn create_openapi_write_server(c: &mut pgrx::spi::SpiClient<'_>) {
+        c.update(
+            r#"CREATE FOREIGN DATA WRAPPER wasm_wrapper
+                 HANDLER wasm_fdw_handler VALIDATOR wasm_fdw_validator"#,
+            None,
+            &[],
+        )
+        .unwrap();
+
+        c.update(
+            r#"CREATE SERVER openapi_write_server
+                 FOREIGN DATA WRAPPER wasm_wrapper
+                 OPTIONS (
+                   fdw_package_url 'file://../../../wasm-wrappers/fdw/target/wasm32-unknown-unknown/release/openapi_fdw.wasm',
+                   fdw_package_name 'supabase:openapi-fdw',
+                   fdw_package_version '>=0.1.0',
+                   base_url 'http://localhost:8096/openapi'
+                 )"#,
+            None,
+            &[],
+        )
+        .unwrap();
+    }
+
+    // Exercises the OpenAPI FDW write support end-to-end against the mock
+    // server. The mock validates the request shapes a type-faithful FDW must
+    // produce (rowid placement, no attrs/rowid in body, numbers as JSON
+    // numbers) and answers with 4xx or in-band failure codes otherwise, so a
+    // malformed request fails the statement.
+    #[pg_test]
+    fn openapi_write_support() {
+        Spi::connect_mut(|c| {
+            create_openapi_write_server(c);
+
+            // Plain JSON API: rowid appended to the URL path.
+            c.update(
+                r#"
+                  CREATE FOREIGN TABLE wr_items (
+                    id text,
+                    name text,
+                    count bigint,
+                    active boolean
+                  )
+                  SERVER openapi_write_server
+                  OPTIONS (
+                    endpoint '/wr_items',
+                    rowid_column 'id',
+                    writable 'true',
+                    insert_method 'POST',
+                    update_method 'PATCH',
+                    delete_method 'DELETE'
+                  )
+             "#,
+                None,
+                &[],
+            )
+            .unwrap();
+
+            // UPDATE -> PATCH /wr_items/i-1 with a sparse typed JSON body.
+            // The scan phase first fetches the row via GET (rowid pushdown).
+            c.update(
+                "UPDATE wr_items SET name = 'renamed', count = 7, active = true WHERE id = 'i-1'",
+                None,
+                &[],
+            )
+            .unwrap();
+
+            // INSERT -> POST /wr_items; null id is omitted from the body.
+            c.update(
+                "INSERT INTO wr_items (name, count, active) VALUES ('new item', 3, false)",
+                None,
+                &[],
+            )
+            .unwrap();
+
+            // DELETE -> DELETE /wr_items/i-1 (rowid in URL path).
+            c.update("DELETE FROM wr_items WHERE id = 'i-1'", None, &[])
+                .unwrap();
+
+            // Envelope API (the hard case): PUT to the collection URL with
+            // {"data":[{...}]}, rowid inside the record, and per-record
+            // success signalled by a code in the HTTP 200 response body.
+            c.update(
+                r#"
+                  CREATE FOREIGN TABLE wr_enveloped (
+                    id text,
+                    stage text,
+                    amount numeric
+                  )
+                  SERVER openapi_write_server
+                  OPTIONS (
+                    endpoint '/wr_enveloped',
+                    rowid_column 'id',
+                    writable 'true',
+                    update_method 'PUT',
+                    rowid_location 'body',
+                    body_root_path '/data',
+                    body_wrap 'array',
+                    success_path '/data/0/code',
+                    success_value 'SUCCESS',
+                    success_status '200,201,202'
+                  )
+             "#,
+                None,
+                &[],
+            )
+            .unwrap();
+
+            // The mock answers {"data":[{"code":"SUCCESS"}]} only when the
+            // envelope, rowid placement, and value types are all correct.
+            c.update(
+                "UPDATE wr_enveloped SET stage = 'Qualification', amount = 8000 WHERE id = 'e-1'",
+                None,
+                &[],
+            )
+            .unwrap();
+
+            // Mixed per-verb rowid placement: DELETE via query parameter
+            // (?ids=<id>) while other verbs would use the default.
+            c.update(
+                r#"
+                  CREATE FOREIGN TABLE wr_delete (
+                    id text,
+                    name text
+                  )
+                  SERVER openapi_write_server
+                  OPTIONS (
+                    endpoint '/wr_delete',
+                    rowid_column 'id',
+                    writable 'true',
+                    delete_method 'DELETE',
+                    delete_rowid_location 'query',
+                    rowid_param 'ids',
+                    success_path '/code',
+                    success_value 'SUCCESS'
+                  )
+             "#,
+                None,
+                &[],
+            )
+            .unwrap();
+
+            // The mock returns code SUCCESS only when it sees ?ids=d-1.
+            c.update("DELETE FROM wr_delete WHERE id = 'd-1'", None, &[])
+                .unwrap();
+
+            // Writes are strictly per-row with exactly one request per row:
+            // the mock counts POSTs to /wr_count and reports the counter via
+            // GET, so a 3-row INSERT must move it by exactly 3.
+            c.update(
+                r#"
+                  CREATE FOREIGN TABLE wr_count (
+                    id text,
+                    name text,
+                    posts bigint
+                  )
+                  SERVER openapi_write_server
+                  OPTIONS (
+                    endpoint '/wr_count',
+                    rowid_column 'id',
+                    writable 'true',
+                    insert_method 'POST'
+                  )
+             "#,
+                None,
+                &[],
+            )
+            .unwrap();
+
+            let count_before = c
+                .select("SELECT posts FROM wr_count", None, &[])
+                .unwrap()
+                .filter_map(|r| r.get_by_name::<i64, _>("posts").unwrap())
+                .next()
+                .unwrap();
+
+            c.update(
+                "INSERT INTO wr_count (name) VALUES ('a'), ('b'), ('c')",
+                None,
+                &[],
+            )
+            .unwrap();
+
+            let count_after = c
+                .select("SELECT posts FROM wr_count", None, &[])
+                .unwrap()
+                .filter_map(|r| r.get_by_name::<i64, _>("posts").unwrap())
+                .next()
+                .unwrap();
+            assert_eq!(count_after - count_before, 3);
+        });
+    }
+
+    // An HTTP 200 response carrying an in-band failure code must fail the
+    // statement when success_path is configured.
+    #[pg_test]
+    fn openapi_write_failure_code_rejected() {
+        Spi::connect_mut(|c| {
+            create_openapi_write_server(c);
+            c.update(
+                r#"
+                  CREATE FOREIGN TABLE wr_failcode (
+                    id text,
+                    name text
+                  )
+                  SERVER openapi_write_server
+                  OPTIONS (
+                    endpoint '/wr_failcode',
+                    rowid_column 'id',
+                    writable 'true',
+                    insert_method 'POST',
+                    success_path '/code',
+                    success_value 'SUCCESS'
+                  )
+             "#,
+                None,
+                &[],
+            )
+            .unwrap();
+        });
+
+        // The mock returns HTTP 200 with {"code":"FAILED"}.
+        let result = std::panic::catch_unwind(|| {
+            Spi::connect_mut(|c| {
+                c.update("INSERT INTO wr_failcode (name) VALUES ('x')", None, &[])
+                    .is_err()
+            })
+        });
+        assert!(result.is_err());
+    }
+
+    // HTTP 207 Multi-Status is rejected: per-record outcomes inside it cannot
+    // be verified.
+    #[pg_test]
+    fn openapi_write_multistatus_rejected() {
+        Spi::connect_mut(|c| {
+            create_openapi_write_server(c);
+            c.update(
+                r#"
+                  CREATE FOREIGN TABLE wr_multistatus (
+                    id text,
+                    name text
+                  )
+                  SERVER openapi_write_server
+                  OPTIONS (
+                    endpoint '/wr_multistatus',
+                    rowid_column 'id',
+                    writable 'true',
+                    insert_method 'POST'
+                  )
+             "#,
+                None,
+                &[],
+            )
+            .unwrap();
+        });
+
+        let result = std::panic::catch_unwind(|| {
+            Spi::connect_mut(|c| {
+                c.update("INSERT INTO wr_multistatus (name) VALUES ('x')", None, &[])
+                    .is_err()
+            })
+        });
+        assert!(result.is_err());
+    }
+
+    // DML on a table without writable 'true' is rejected in begin_modify,
+    // before any HTTP request.
+    #[pg_test]
+    fn openapi_write_requires_writable_option() {
+        Spi::connect_mut(|c| {
+            create_openapi_write_server(c);
+            c.update(
+                r#"
+                  CREATE FOREIGN TABLE wr_readonly (
+                    id text,
+                    name text
+                  )
+                  SERVER openapi_write_server
+                  OPTIONS (
+                    endpoint '/wr_items',
+                    rowid_column 'id',
+                    insert_method 'POST'
+                  )
+             "#,
+                None,
+                &[],
+            )
+            .unwrap();
+        });
+
+        let result = std::panic::catch_unwind(|| {
+            Spi::connect_mut(|c| {
+                c.update("INSERT INTO wr_readonly (name) VALUES ('x')", None, &[])
+                    .is_err()
+            })
+        });
+        assert!(result.is_err());
+    }
+
+    // An op whose *_method is unset errors instead of silently no-op'ing.
+    #[pg_test]
+    fn openapi_write_disabled_op_rejected() {
+        Spi::connect_mut(|c| {
+            create_openapi_write_server(c);
+            c.update(
+                r#"
+                  CREATE FOREIGN TABLE wr_insert_only (
+                    id text,
+                    name text
+                  )
+                  SERVER openapi_write_server
+                  OPTIONS (
+                    endpoint '/wr_items',
+                    rowid_column 'id',
+                    writable 'true',
+                    insert_method 'POST'
+                  )
+             "#,
+                None,
+                &[],
+            )
+            .unwrap();
+        });
+
+        // update_method is unset, so UPDATE must error.
+        let result = std::panic::catch_unwind(|| {
+            Spi::connect_mut(|c| {
+                c.update(
+                    "UPDATE wr_insert_only SET name = 'y' WHERE id = 'i-1'",
+                    None,
+                    &[],
+                )
+                .is_err()
+            })
+        });
+        assert!(result.is_err());
+    }
+
+    // A writable envelope table without success_path is a misconfiguration
+    // that errors in begin_modify (the API may signal per-record failure
+    // inside a 2xx body, which a status check alone cannot detect).
+    #[pg_test]
+    fn openapi_write_envelope_requires_success_path() {
+        Spi::connect_mut(|c| {
+            create_openapi_write_server(c);
+            c.update(
+                r#"
+                  CREATE FOREIGN TABLE wr_misconfigured (
+                    id text,
+                    name text
+                  )
+                  SERVER openapi_write_server
+                  OPTIONS (
+                    endpoint '/wr_enveloped',
+                    rowid_column 'id',
+                    writable 'true',
+                    insert_method 'POST',
+                    body_root_path '/data',
+                    body_wrap 'array'
+                  )
+             "#,
+                None,
+                &[],
+            )
+            .unwrap();
+        });
+
+        let result = std::panic::catch_unwind(|| {
+            Spi::connect_mut(|c| {
+                c.update(
+                    "INSERT INTO wr_misconfigured (name) VALUES ('x')",
+                    None,
+                    &[],
+                )
+                .is_err()
+            })
+        });
+        assert!(result.is_err());
+    }
+
+    // RETURNING is rejected at plan time by the host framework.
+    #[pg_test]
+    fn openapi_write_returning_rejected() {
+        Spi::connect_mut(|c| {
+            create_openapi_write_server(c);
+            c.update(
+                r#"
+                  CREATE FOREIGN TABLE wr_returning (
+                    id text,
+                    name text
+                  )
+                  SERVER openapi_write_server
+                  OPTIONS (
+                    endpoint '/wr_items',
+                    rowid_column 'id',
+                    writable 'true',
+                    insert_method 'POST'
+                  )
+             "#,
+                None,
+                &[],
+            )
+            .unwrap();
+        });
+
+        let result = std::panic::catch_unwind(|| {
+            Spi::connect_mut(|c| {
+                c.update(
+                    "INSERT INTO wr_returning (name) VALUES ('x') RETURNING id",
+                    None,
+                    &[],
+                )
+                .is_err()
+            })
+        });
+        assert!(result.is_err());
+    }
 }

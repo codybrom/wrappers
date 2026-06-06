@@ -18,11 +18,12 @@ Point it at an OpenAPI spec and query the API with SQL. The FDW parses the spec 
 - **Type coercion** — Maps JSON types to PostgreSQL types (`text`, `integer`, `boolean`, `timestamptz`, `jsonb`, etc.)
 - **camelCase matching** — Matches API field names like `stationIdentifier` to snake_case columns like `station_identifier`
 - **Auth support** — API key (header, query param, or cookie) and Bearer token authentication, with Supabase Vault integration or per-request tokens from a session variable (`auth_token_setting`)
+- **Write support** — Opt-in INSERT/UPDATE/DELETE (`writable 'true'` plus per-op verbs) with configurable rowid placement (URL path, body, or query param), body envelopes, and body-level success checking for APIs that signal per-record failure inside 2xx responses
 - **Debug mode** — Set `debug 'true'` on the server to log HTTP request/response details as PostgreSQL INFO messages
 
 ## Limitations
 
-- Read-only (no INSERT/UPDATE/DELETE)
+- Writes are per-row and non-transactional (no rollback of HTTP calls), with no `RETURNING`, batching, or form-encoded bodies
 - POST-for-read available via `method` table option, but only GET endpoints are auto-imported
 - Auth: API key and Bearer token, static or resolved per request from a session variable (no OAuth2 flows — supply pre-obtained tokens)
 - OpenAPI 3.x only (Swagger 2.0 is rejected)
@@ -148,6 +149,8 @@ For queries you run frequently, a [materialized view](https://supabase.com/blog/
 
 | Version | Date | Notes |
 | --- | --- | --- |
+| 0.3.0 | TBD | Write support: opt-in INSERT/UPDATE/DELETE with per-op verbs/endpoints, configurable rowid placement (url/body/query), body envelopes, body-level success checking, leak-safe write errors |
+| 0.2.1 | TBD | RFC 8288 `Link` header pagination, per-request credentials from session variables (`auth_token_setting`) |
 | 0.2.0 | 2026-02-15 | Modular architecture, POST-for-read, `spec_json` inline specs, YAML spec support, LIMIT pushdown, OpenAPI 3.1 support, security hardening, 534 unit tests, 5 real-world examples |
 | 0.1.4 | 2026-02-09 | Type coercion, auth validation, table naming, URL fixes |
 | 0.1.3 | 2026-02-06 | Avoid cloning JSON response data |

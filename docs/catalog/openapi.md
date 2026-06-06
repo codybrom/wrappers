@@ -12,12 +12,13 @@ tags:
 
 [OpenAPI](https://www.openapis.org/) is a specification for describing HTTP APIs. The OpenAPI Wrapper is a generic WebAssembly (Wasm) foreign data wrapper that can connect to any REST API with an OpenAPI 3.0+ specification.
 
-This wrapper allows you to query any REST API endpoint as a PostgreSQL foreign table, with support for path parameters, pagination, POST-for-read endpoints, and automatic schema import.
+This wrapper allows you to query any REST API endpoint as a PostgreSQL foreign table, with support for path parameters, pagination, POST-for-read endpoints, automatic schema import, and data modification (INSERT / UPDATE / DELETE) on tables that opt in.
 
 ## Available Versions
 
 | Version | Wasm Package URL | Checksum | Required Wrappers Version |
 | ------- | ---------------- | -------- | ------------------------- |
+| 0.3.0 | `https://github.com/supabase/wrappers/releases/download/wasm_openapi_fdw_v0.3.0/openapi_fdw.wasm` | `tbd` | >=0.6.2 |
 | 0.2.1 | `https://github.com/supabase/wrappers/releases/download/wasm_openapi_fdw_v0.2.1/openapi_fdw.wasm` | `12c902f3089e18142a1d8d35c66b9ceb85c193224229687bd929aff6b44cddde` | >=0.6.2 |
 | 0.2.0 | `https://github.com/supabase/wrappers/releases/download/wasm_openapi_fdw_v0.2.0/openapi_fdw.wasm` | `f0d4d6e50f7c519a66363bd8bdbe1ea8086ca810ca14b43fb0ed18b64acdf6aa` | >=0.5.0 |
 | 0.1.4 | `https://github.com/supabase/wrappers/releases/download/wasm_openapi_fdw_v0.1.4/openapi_fdw.wasm` | `dd434f8565b060b181d1e69e1e4d5c8b9c3ac5ca444056d3c2fb939038d308fe` | >=0.5.0 |
@@ -153,7 +154,7 @@ options (
 | Option | Required | Description |
 | ------ | :------: | ----------- |
 | `endpoint` | Yes | API endpoint path (e.g., `/users`, `/users/{user_id}/posts`). |
-| `rowid_column` | No | Column used as row identifier for single-resource access and modifications (default: `id`). |
+| `rowid_column` | No | Column used as row identifier for single-resource access and modifications (default: `id`). Optional for data scan, required for data modify. |
 | `response_path` | No | JSON pointer to extract data array from response (e.g., `/data`, `/results`). |
 | `object_path` | No | JSON pointer to extract nested object from each row (e.g., `/properties` for GeoJSON). |
 | `cursor_path` | No | JSON pointer to pagination cursor in response. |
@@ -162,6 +163,27 @@ options (
 | `page_size` | No | Override server-level page size. |
 | `method` | No | HTTP method for this endpoint. Use `POST` for read-via-POST endpoints (default: `GET`). |
 | `request_body` | No | Request body string for POST endpoints. |
+
+#### Write Options
+
+These options enable and shape INSERT / UPDATE / DELETE; see [Data Modify](#data-modify-insert-update-delete). All are optional and writes stay disabled until `writable` is `'true'`.
+
+| Option | Default | Description |
+| ------ | ------- | ----------- |
+| `writable` | `false` | Capability gate. DML on a table without `writable 'true'` errors before any HTTP request. |
+| `insert_method` | unset → INSERT disabled | HTTP verb for INSERT (`POST`/`PUT`/`PATCH`). Presence enables INSERT. |
+| `update_method` | unset → UPDATE disabled | HTTP verb for UPDATE (`PUT`/`PATCH`/`POST`). Presence enables UPDATE. |
+| `delete_method` | unset → DELETE disabled | HTTP verb for DELETE (`DELETE`, or `POST` for soft-delete). Presence enables DELETE. |
+| `write_endpoint` | falls back to `endpoint` | Path template for writes when it differs from the read endpoint. Per-op `insert_endpoint`/`update_endpoint`/`delete_endpoint` are also accepted, falling back to `write_endpoint` then `endpoint`. |
+| `rowid_location` | `url` | Rowid placement for UPDATE/DELETE: `url` → `.../{rowid}` path suffix, `body` → injected under `rowid_body_key`, `query` → `...?{rowid_param}={rowid}`. |
+| `update_rowid_location`, `delete_rowid_location` | fall back to `rowid_location` | Per-verb overrides, for APIs that mix placements on one resource (e.g. `url` for UPDATE but `query` for DELETE). |
+| `rowid_body_key` | = `rowid_column` | JSON key the rowid is written under when the effective rowid location is `body`. |
+| `rowid_param` | = `rowid_column` | Query parameter name when the effective rowid location is `query` (e.g. `ids`). |
+| `body_root_path` | unset → bare body | JSON pointer wrapping the body. `/data` plus `body_wrap 'array'` gives `{"data":[{...}]}`. |
+| `body_wrap` | `object` | `object` → `{root:{...}}`; `array` → `{root:[{...}]}`. `array` without `body_root_path` is an error. |
+| `success_path` | unset | JSON pointer to the per-record outcome in a 2xx response body (e.g. `/data/0/code`). See [Body-level success checking](#body-level-success-checking). |
+| `success_value` | `SUCCESS` | Expected value at `success_path`. |
+| `success_status` | unset → accept any 2xx except 207 | HTTP status allowlist for writes (e.g. `200,201,202`). HTTP 207 is always rejected. |
 
 ### Automatic Schema Import
 
@@ -285,6 +307,130 @@ options (
 select id, title, score from openapi.search_results;
 ```
 
+## Data Modify (INSERT, UPDATE, DELETE)
+
+Foreign tables can opt in to data modification with the `writable 'true'` option plus a per-operation HTTP verb. Each operation is enabled independently:
+
+| Operation | Enabled by | Disabled behavior |
+| --------- | ---------- | ----------------- |
+| INSERT | `insert_method` | statement errors |
+| UPDATE | `update_method` | statement errors |
+| DELETE | `delete_method` | statement errors |
+| TRUNCATE | — | not supported |
+
+`rowid_column` is required for any data modify (it identifies the record for UPDATE/DELETE), and all misconfiguration is rejected before any HTTP request is made.
+
+Writes are strictly per-row: a statement affecting N rows issues N HTTP requests. The JSON body is built from the row's columns with faithful types (numbers stay JSON numbers, booleans stay booleans, `jsonb` columns pass through as nested JSON). Null columns are omitted, which keeps `PATCH` bodies sparse. The `attrs` catch-all column and columns consumed as `{param}` path placeholders are never sent in the body.
+
+### Basic example
+
+A plain JSON API with the record id in the URL path (the GitHub style):
+
+```sql
+create foreign table openapi.gh_pulls (
+  number bigint,
+  title text,
+  state text,
+  attrs jsonb
+)
+server github_server
+options (
+  endpoint '/repos/octocat/hello/pulls',
+  rowid_column 'number',
+  writable 'true',
+  update_method 'PATCH'
+);
+
+update openapi.gh_pulls set title = 'New title', state = 'closed' where number = 42;
+-- PATCH .../pulls/42   body: {"title":"New title","state":"closed"}  (number in URL, not body)
+```
+
+INSERT against a parameterized endpoint substitutes `{param}` placeholders from the inserted row's columns, and excludes those columns from the body:
+
+```sql
+create foreign table openapi.gh_comments (
+  owner text,
+  repo text,
+  issue_number bigint,
+  body text
+)
+server github_server
+options (
+  endpoint '/repos/{owner}/{repo}/issues/{issue_number}/comments',
+  rowid_column 'id',
+  writable 'true',
+  insert_method 'POST'
+);
+
+insert into openapi.gh_comments (owner, repo, issue_number, body)
+values ('octocat', 'hello', 7, 'Thanks, merging.');
+-- POST /repos/octocat/hello/issues/7/comments   body: {"body":"Thanks, merging."}
+```
+
+### Rowid placement
+
+`rowid_location` controls where the record id goes on UPDATE/DELETE: appended to the URL path (`url`, the default), injected into the JSON body under `rowid_body_key` (`body`), or sent as a query parameter named `rowid_param` (`query`). Per-verb overrides (`update_rowid_location`, `delete_rowid_location`) express APIs that mix placements on a single resource.
+
+### Body envelope
+
+`body_root_path` and `body_wrap` wrap the record for envelope-style APIs. A full example for a CRM-style API that wants `PUT /records/{id}` with an array envelope, signals per-record success inside HTTP 200/202 bodies, and deletes via a query parameter:
+
+```sql
+create foreign table openapi.crm_records (
+  id text,
+  "Stage" text,
+  "Amount" numeric,
+  "Owner" jsonb,
+  attrs jsonb
+)
+server crm_server
+options (
+  endpoint '/records',
+  rowid_column 'id',
+  writable 'true',
+  insert_method 'POST',
+  update_method 'PUT',
+  update_rowid_location 'url',                    -- PUT /records/{id}
+  delete_method 'DELETE',
+  delete_rowid_location 'query', rowid_param 'ids',  -- DELETE /records?ids=<id>
+  body_root_path '/data', body_wrap 'array',      -- {"data":[ {...} ]}
+  success_path '/data/0/code', success_value 'SUCCESS',
+  success_status '200,201,202'                    -- insert returns 202
+);
+
+update openapi.crm_records set "Stage" = 'Qualification', "Amount" = 8000
+where id = '1000000000000489124';
+-- PUT /records/1000...  body: {"data":[{"Stage":"Qualification","Amount":8000}]}
+-- HTTP 200 with /data/0/code == "SUCCESS" → ok; any other code → statement error
+```
+
+Nested object fields (like `"Owner"` above) are written through `jsonb` columns, which pass into the body as parsed JSON.
+
+### Body-level success checking
+
+Some APIs return HTTP 2xx and signal per-record failure inside the response body (e.g. HTTP 202 with a record code other than `SUCCESS`). A status check alone would silently treat those failed writes as successful. Set `success_path` (and optionally `success_value`) so the FDW verifies the outcome inside every 2xx write response and raises a statement error on failure.
+
+When a writable table's options signal such an API — an explicit `success_status` containing codes beyond `200`/`201`/`204`, or a `body_root_path` envelope — `success_path` is required, and the statement errors before any HTTP request if it's missing. HTTP 207 Multi-Status responses are always rejected, since per-record outcomes inside them cannot be verified.
+
+!!! warning "Writes are not transactional"
+
+    Writes cannot be rolled back. Each affected row issues an immediate HTTP request. An UPDATE over 500 rows that fails on row 300 leaves rows 1–299 permanently written on the remote API and aborts with a SQL error; `ROLLBACK` cannot undo HTTP calls, and `RETURNING` is unavailable to even report which rows succeeded. A `statement_timeout` firing mid-sequence leaves the same half-mutated state. Prefer small batches.
+
+!!! warning "Transient failures can double-apply POST/PATCH"
+
+    The Wrappers host retries transient HTTP failures (5xx, timeouts) up to 3 times, including on non-idempotent POST/PATCH requests. A write the remote API already applied before returning a transient error may be silently re-sent — a double-create or double-apply. The FDW itself never re-sends a write, so at most the host's retries apply. Prefer APIs with server-side idempotency where duplicates matter.
+
+### Write limitations
+
+- **No `RETURNING`** — rejected at statement planning. Server-assigned ids returned only in the response body are not visible to SQL; re-select to observe them.
+- **No batching** — a 100-row statement issues 100 requests, not one bulk call. Each request is a blocking round-trip, so large statements hold the connection; be mindful of `statement_timeout`.
+- **JSON bodies only** — form-encoded write bodies (`application/x-www-form-urlencoded`) are not supported.
+- **`IMPORT FOREIGN SCHEMA` stays read-only** — imported tables never carry write options; add `writable 'true'` and the per-op options manually.
+
+!!! note "Privileges"
+
+    `writable` is a capability flag, not a privilege boundary. Writes execute under the server's single credential, so granting INSERT/UPDATE/DELETE on a writable foreign table effectively grants use of that credential; row-level security does not constrain FDW writes. Apply least-privilege `GRANT`s.
+
 ## Debug Mode
 
 Enable debug mode to see HTTP request details and scan statistics in PostgreSQL INFO messages:
@@ -403,18 +549,20 @@ options (endpoint '/users');
 
 ## Limitations
 
-- **Read-only**: This FDW only supports SELECT operations. INSERT, UPDATE, and DELETE are not supported at this time.
+- **Writes are opt-in and non-transactional**: INSERT, UPDATE, and DELETE require `writable 'true'` plus per-operation options, issue one immediate HTTP request per row, and cannot be rolled back. `RETURNING` is not supported. See [Data Modify](#data-modify-insert-update-delete).
 - **No transactions**: Each SQL statement results in immediate HTTP requests; there is no transactional grouping.
 - **Authentication**: Supports API Key and Bearer Token authentication, either static (server option or Vault) or resolved per request from a session variable (see [Per-request credentials](#per-request-credentials-session-variables)). The FDW does not run OAuth flows itself, but a session variable lets you supply a token your application already obtained.
 - **OpenAPI version**: Only OpenAPI 3.0+ specifications are supported (not Swagger 2.0).
 
 ## Automatic Retries
 
-The FDW automatically retries transient HTTP errors up to 3 times:
+The FDW automatically retries transient HTTP errors on read requests up to 3 times:
 
 - **HTTP 429** (Rate Limit), **502** (Bad Gateway), **503** (Service Unavailable)
 - **Retry-After header**: Respects server-specified delay when provided
 - **Exponential backoff**: Falls back to 1s, 2s, 4s delays when no Retry-After header is present
+
+Write requests are never retried by the FDW itself, though the Wrappers host retries transient failures up to 3 times for all requests — see the [double-apply warning](#data-modify-insert-update-delete) under Data Modify.
 
 For APIs with very strict rate limits, consider using materialized views to cache results.
 

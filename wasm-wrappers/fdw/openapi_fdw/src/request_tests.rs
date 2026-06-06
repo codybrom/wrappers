@@ -570,8 +570,9 @@ fn test_resolve_pagination_url_no_api_key_unchanged() {
 
 #[test]
 fn test_substitute_path_params_unclosed_brace_error() {
+    let params = std::collections::HashMap::new();
     let mut injected = std::collections::HashMap::new();
-    let result = OpenApiFdw::substitute_path_params("/items/{id", &[], &mut injected);
+    let result = OpenApiFdw::substitute_path_params("/items/{id", &params, &mut injected);
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(err.contains("Unclosed '{'"));
@@ -580,10 +581,116 @@ fn test_substitute_path_params_unclosed_brace_error() {
 
 #[test]
 fn test_substitute_path_params_unclosed_brace_after_valid() {
+    let params = std::collections::HashMap::new();
     let mut injected = std::collections::HashMap::new();
     // First param is valid, second is unclosed
     let result =
-        OpenApiFdw::substitute_path_params("/users/{user_id}/posts/{title", &[], &mut injected);
+        OpenApiFdw::substitute_path_params("/users/{user_id}/posts/{title", &params, &mut injected);
     assert!(result.is_err());
     assert!(result.unwrap_err().contains("Unclosed '{'"));
+}
+
+// --- Map-based path parameter substitution ---
+//
+// substitute_path_params takes a pre-built name -> value map. The read path
+// builds it from WHERE-clause quals (build_url); the write path builds it
+// from row columns/cells (write::row_param_map). The map-only signature makes
+// it structurally impossible for stale scan quals to drive a write URL: the
+// write hooks never call ctx.get_quals().
+
+fn params_of(entries: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+    entries
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+        .collect()
+}
+
+#[test]
+fn test_substitute_path_params_from_map_basic() {
+    let params = params_of(&[("user_id", "u-1")]);
+    let mut injected = std::collections::HashMap::new();
+    let (endpoint, used) =
+        OpenApiFdw::substitute_path_params("/users/{user_id}/posts", &params, &mut injected)
+            .unwrap();
+    assert_eq!(endpoint, "/users/u-1/posts");
+    assert_eq!(used, vec!["user_id"]);
+    assert_eq!(injected.get("user_id"), Some(&"u-1".to_string()));
+}
+
+#[test]
+fn test_substitute_path_params_from_map_case_insensitive() {
+    // Lowercase map key matches a differently-cased placeholder
+    let params = params_of(&[("user_id", "u-1")]);
+    let mut injected = std::collections::HashMap::new();
+    let (endpoint, _) =
+        OpenApiFdw::substitute_path_params("/users/{User_Id}/posts", &params, &mut injected)
+            .unwrap();
+    assert_eq!(endpoint, "/users/u-1/posts");
+}
+
+#[test]
+fn test_substitute_path_params_from_map_urlencodes() {
+    let params = params_of(&[("id", "a/b c")]);
+    let mut injected = std::collections::HashMap::new();
+    let (endpoint, _) =
+        OpenApiFdw::substitute_path_params("/x/{id}", &params, &mut injected).unwrap();
+    assert_eq!(endpoint, "/x/a%2Fb%20c");
+}
+
+#[test]
+fn test_substitute_path_params_from_map_missing_errors() {
+    let params = std::collections::HashMap::new();
+    let mut injected = std::collections::HashMap::new();
+    let err =
+        OpenApiFdw::substitute_path_params("/users/{user_id}", &params, &mut injected).unwrap_err();
+    assert!(err.contains("Missing required path parameter"));
+    assert!(err.contains("user_id"));
+}
+
+#[test]
+fn test_substitute_path_params_from_map_no_braces_passthrough() {
+    let params = params_of(&[("anything", "x")]);
+    let mut injected = std::collections::HashMap::new();
+    let (endpoint, used) =
+        OpenApiFdw::substitute_path_params("/items", &params, &mut injected).unwrap();
+    assert_eq!(endpoint, "/items");
+    assert!(used.is_empty());
+    assert!(injected.is_empty());
+}
+
+#[test]
+fn test_substitute_path_params_from_map_multiple() {
+    let params = params_of(&[("org", "supabase"), ("repo", "wrappers")]);
+    let mut injected = std::collections::HashMap::new();
+    let (endpoint, used) =
+        OpenApiFdw::substitute_path_params("/projects/{org}/{repo}/issues", &params, &mut injected)
+            .unwrap();
+    assert_eq!(endpoint, "/projects/supabase/wrappers/issues");
+    assert_eq!(used, vec!["org", "repo"]);
+}
+
+#[test]
+fn test_substitute_path_params_row_map_wins_not_stale_quals() {
+    // Stale-qual regression: the value used is whatever map the caller
+    // passes. The write path passes a row-derived map, so a stale qual value
+    // ("FROM_QUAL", left over in host state from a prior scan) can never
+    // reach the URL — only the row value ("FROM_ROW") can.
+    let row_map = params_of(&[("user_id", "FROM_ROW")]);
+    let mut injected = std::collections::HashMap::new();
+    let (endpoint, _) =
+        OpenApiFdw::substitute_path_params("/users/{user_id}/x", &row_map, &mut injected).unwrap();
+    assert_eq!(endpoint, "/users/FROM_ROW/x");
+    assert!(!endpoint.contains("FROM_QUAL"));
+    assert_eq!(injected.get("user_id"), Some(&"FROM_ROW".to_string()));
+}
+
+// --- HTTP method labels (debug logger) ---
+
+#[test]
+fn test_method_label_all_verbs() {
+    assert_eq!(method_label(http::Method::Get), "GET");
+    assert_eq!(method_label(http::Method::Post), "POST");
+    assert_eq!(method_label(http::Method::Put), "PUT");
+    assert_eq!(method_label(http::Method::Patch), "PATCH");
+    assert_eq!(method_label(http::Method::Delete), "DELETE");
 }

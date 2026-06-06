@@ -15,6 +15,7 @@ mod request;
 mod response;
 mod schema;
 mod spec;
+mod write;
 
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
@@ -36,6 +37,7 @@ use config::ServerConfig;
 use pagination::PaginationState;
 use schema::generate_all_tables;
 use spec::OpenApiSpec;
+use write::{RowidLocation, WriteConfig};
 
 /// The OpenAPI FDW state
 #[derive(Debug)]
@@ -58,6 +60,12 @@ struct OpenApiFdw {
 
     // Pagination state and loop detection
     pagination: PaginationState,
+
+    // Write (DML) configuration, populated in begin_modify; None until then.
+    // Kept separate from the scan fields above: Postgres interleaves the
+    // foreign scan with modify in the same UPDATE/DELETE statement, so write
+    // hooks must not clobber in-flight scan state.
+    write: Option<WriteConfig>,
 
     // Qual values injected as URL path/query params (for injecting back into rows)
     injected_params: HashMap<String, String>,
@@ -93,6 +101,7 @@ impl Default for OpenApiFdw {
             rowid_col: String::new(),
             cursor_path: String::new(),
             pagination: PaginationState::default(),
+            write: None,
             injected_params: HashMap::new(),
             src_rows: Vec::new(),
             src_idx: 0,
@@ -116,7 +125,6 @@ impl Default for OpenApiFdw {
 static mut INSTANCE: *mut OpenApiFdw = std::ptr::null_mut::<OpenApiFdw>();
 static FDW_NAME: &str = "OpenApiFdw";
 
-const READ_ONLY_ERROR: &str = "OpenAPI FDW is read-only";
 const HOST_VERSION_REQUIREMENT: &str = "^0.1.0";
 const DEFAULT_PAGE_SIZE_PARAM: &str = "limit";
 const DEFAULT_CURSOR_PARAM: &str = "after";
@@ -430,24 +438,175 @@ impl Guest for OpenApiFdw {
         Ok(())
     }
 
-    fn begin_modify(_ctx: &Context) -> FdwResult {
-        Err(READ_ONLY_ERROR.to_string())
+    fn begin_modify(ctx: &Context) -> FdwResult {
+        let this = Self::this_mut();
+        let opts = ctx.get_options(&OptionsType::Table);
+
+        // Read into locals, not the scan fields: an UPDATE/DELETE statement
+        // interleaves the foreign scan with modify on this singleton, and
+        // clobbering scan state would corrupt in-flight pagination.
+        let endpoint = opts.require("endpoint")?;
+        let rowid_col = opts
+            .require_or("rowid_column", DEFAULT_ROWID_COLUMN)
+            .to_lowercase();
+
+        // All write validation fires here, before any HTTP request: the
+        // writable gate, bad verbs/enums/pointers, and the required
+        // success_path predicate (see build_write_config).
+        let cfg = write::write_config_from_options(&opts, &endpoint, &rowid_col)?;
+        if !cfg.writable {
+            return Err(
+                "foreign table is read-only. Set the writable 'true' table option \
+                 to enable data modify."
+                    .to_string(),
+            );
+        }
+        this.write = Some(cfg);
+        Ok(())
     }
 
-    fn insert(_ctx: &Context, _row: &Row) -> FdwResult {
-        Err(READ_ONLY_ERROR.to_string())
+    fn insert(_ctx: &Context, row: &Row) -> FdwResult {
+        let this = Self::this_mut();
+        let cfg = this
+            .write
+            .as_ref()
+            .ok_or("write configuration is not initialized")?
+            .clone();
+        let method = cfg.insert_method.ok_or(
+            "INSERT is not enabled for this foreign table. \
+             Set the insert_method table option to enable it.",
+        )?;
+
+        let cols = row.cols();
+        let cells = row.cells();
+
+        // Path params come from the row being written, never from scan quals
+        // (the host keeps quals from a prior begin_scan that are stale here).
+        let params = write::row_param_map(&cols, &cells);
+        let (url, consumed) = this.build_write_url(
+            &cfg.insert_endpoint,
+            &params,
+            None,
+            RowidLocation::Url,
+            &cfg.rowid_column,
+            &cfg.rowid_param,
+        )?;
+
+        // INSERT has no rowid placement; a user-supplied id column stays in
+        // the body like any other column.
+        let body_map = write::build_body(&cols, &cells, None, &consumed)?;
+        let body = write::wrap_envelope(body_map, cfg.body_root_path.as_deref(), cfg.body_wrap)
+            .to_string();
+
+        let safe_endpoint = cfg
+            .insert_endpoint
+            .split('?')
+            .next()
+            .unwrap_or(&cfg.insert_endpoint);
+        this.execute_write(method, url, body, &cfg, safe_endpoint)
     }
 
-    fn update(_ctx: &Context, _rowid: Cell, _row: &Row) -> FdwResult {
-        Err(READ_ONLY_ERROR.to_string())
+    fn update(_ctx: &Context, rowid: Cell, row: &Row) -> FdwResult {
+        let this = Self::this_mut();
+        let cfg = this
+            .write
+            .as_ref()
+            .ok_or("write configuration is not initialized")?
+            .clone();
+        let method = cfg.update_method.ok_or(
+            "UPDATE is not enabled for this foreign table. \
+             Set the update_method table option to enable it.",
+        )?;
+        let rowid_str =
+            write::cell_to_string(&rowid).ok_or("rowid column type is not supported for UPDATE")?;
+
+        let cols = row.cols();
+        let cells = row.cells();
+
+        let mut params = write::row_param_map(&cols, &cells);
+        params.insert(cfg.rowid_column.clone(), rowid_str.clone());
+        let (url, consumed) = this.build_write_url(
+            &cfg.update_endpoint,
+            &params,
+            Some(&rowid_str),
+            cfg.update_rowid_location,
+            &cfg.rowid_column,
+            &cfg.rowid_param,
+        )?;
+
+        // The rowid is placed per update_rowid_location; the row's rowid
+        // column is always excluded from the generic body to avoid
+        // double-emitting it.
+        let mut body_map = write::build_body(&cols, &cells, Some(&cfg.rowid_column), &consumed)?;
+        if cfg.update_rowid_location == RowidLocation::Body {
+            body_map.insert(
+                cfg.rowid_body_key.clone(),
+                write::cell_to_json(&rowid, &cfg.rowid_column)?,
+            );
+        }
+        let body = write::wrap_envelope(body_map, cfg.body_root_path.as_deref(), cfg.body_wrap)
+            .to_string();
+
+        let safe_endpoint = cfg
+            .update_endpoint
+            .split('?')
+            .next()
+            .unwrap_or(&cfg.update_endpoint);
+        this.execute_write(method, url, body, &cfg, safe_endpoint)
     }
 
-    fn delete(_ctx: &Context, _rowid: Cell) -> FdwResult {
-        Err(READ_ONLY_ERROR.to_string())
+    fn delete(_ctx: &Context, rowid: Cell) -> FdwResult {
+        let this = Self::this_mut();
+        let cfg = this
+            .write
+            .as_ref()
+            .ok_or("write configuration is not initialized")?
+            .clone();
+        let method = cfg.delete_method.ok_or(
+            "DELETE is not enabled for this foreign table. \
+             Set the delete_method table option to enable it.",
+        )?;
+        let rowid_str =
+            write::cell_to_string(&rowid).ok_or("rowid column type is not supported for DELETE")?;
+
+        // Only the rowid is available for DELETE; any other {param} in the
+        // endpoint template fails with the missing-parameter error.
+        let mut params = HashMap::with_capacity(1);
+        params.insert(cfg.rowid_column.clone(), rowid_str.clone());
+        let (url, _consumed) = this.build_write_url(
+            &cfg.delete_endpoint,
+            &params,
+            Some(&rowid_str),
+            cfg.delete_rowid_location,
+            &cfg.rowid_column,
+            &cfg.rowid_param,
+        )?;
+
+        // No body unless the rowid itself is body-placed (e.g. a POST-based
+        // soft delete with an enveloped id).
+        let body = if cfg.delete_rowid_location == RowidLocation::Body {
+            let mut body_map = serde_json::Map::new();
+            body_map.insert(
+                cfg.rowid_body_key.clone(),
+                write::cell_to_json(&rowid, &cfg.rowid_column)?,
+            );
+            write::wrap_envelope(body_map, cfg.body_root_path.as_deref(), cfg.body_wrap).to_string()
+        } else {
+            String::default()
+        };
+
+        let safe_endpoint = cfg
+            .delete_endpoint
+            .split('?')
+            .next()
+            .unwrap_or(&cfg.delete_endpoint);
+        this.execute_write(method, url, body, &cfg, safe_endpoint)
     }
 
     fn end_modify(_ctx: &Context) -> FdwResult {
-        Err(READ_ONLY_ERROR.to_string())
+        let this = Self::this_mut();
+        this.write = None;
+        Ok(())
     }
 
     fn import_foreign_schema(

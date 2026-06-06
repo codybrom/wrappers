@@ -43,7 +43,7 @@ fn extract_origin(url: &str) -> &str {
 
 /// Redact a query parameter value from a URL for safe logging.
 /// Replaces the value of the named parameter with [REDACTED].
-fn redact_query_param(url: &str, param_name: &str) -> String {
+pub(crate) fn redact_query_param(url: &str, param_name: &str) -> String {
     let encoded_prefix = format!("{}=", urlencoding::encode(param_name));
     if let Some(start) = url.find(&encoded_prefix) {
         let value_start = start + encoded_prefix.len();
@@ -53,6 +53,17 @@ fn redact_query_param(url: &str, param_name: &str) -> String {
         format!("{}[REDACTED]{}", &url[..value_start], &url[value_end..])
     } else {
         url.to_string()
+    }
+}
+
+/// Human-readable HTTP method name for debug logging.
+pub(crate) fn method_label(method: http::Method) -> &'static str {
+    match method {
+        http::Method::Get => "GET",
+        http::Method::Post => "POST",
+        http::Method::Put => "PUT",
+        http::Method::Patch => "PATCH",
+        http::Method::Delete => "DELETE",
     }
 }
 
@@ -200,7 +211,13 @@ impl OpenApiFdw {
         }
     }
 
-    /// Substitute path parameters in endpoint template from quals.
+    /// Substitute path parameters in endpoint template from a pre-built
+    /// name -> value map (keyed by both original and lowercase names).
+    ///
+    /// The read path builds the map from WHERE-clause quals (see build_url);
+    /// the write path builds it from row columns/cells. Taking a plain map
+    /// instead of quals keeps stale scan quals structurally unable to leak
+    /// into write URLs (the write path never calls ctx.get_quals()).
     ///
     /// Writes substituted values into injected so they can be re-injected
     /// into result rows (ensuring PostgreSQL's post-filter passes).
@@ -209,25 +226,14 @@ impl OpenApiFdw {
     /// contains lowercase names of parameters that were substituted.
     ///
     /// # Errors
-    /// Returns an error if required path parameters are missing from quals.
+    /// Returns an error if required path parameters are missing from params.
     pub(crate) fn substitute_path_params(
         endpoint: &str,
-        quals: &[Qual],
+        params: &HashMap<String, String>,
         injected: &mut HashMap<String, String>,
     ) -> Result<(String, Vec<String>), String> {
         if !endpoint.contains('{') {
             return Ok((endpoint.to_string(), Vec::new()));
-        }
-
-        // Build a map of qual field -> value for path parameter substitution
-        // Pre-allocate for 2 entries per qual (original + lowercase key)
-        let mut qual_map: HashMap<String, String> = HashMap::with_capacity(quals.len() * 2);
-        for qual in quals {
-            if let Some(value) = Self::qual_value_to_string(qual) {
-                // Store both original and lowercase versions for flexible matching
-                qual_map.insert(qual.field().to_lowercase(), value.clone());
-                qual_map.insert(qual.field(), value);
-            }
         }
 
         let mut endpoint = endpoint.to_string();
@@ -240,10 +246,8 @@ impl OpenApiFdw {
                 let param_name = &endpoint[start + 1..start + end];
                 let param_lower = param_name.to_lowercase();
 
-                // Try to find matching qual (case-insensitive)
-                let value = qual_map
-                    .get(&param_lower)
-                    .or_else(|| qual_map.get(param_name));
+                // Try to find a matching value (case-insensitive)
+                let value = params.get(&param_lower).or_else(|| params.get(param_name));
 
                 if let Some(val) = value {
                     path_params_used.push(param_lower.clone());
@@ -389,9 +393,20 @@ impl OpenApiFdw {
 
         let quals = ctx.get_quals();
 
+        // Build a map of qual field -> value for path parameter substitution
+        // Pre-allocate for 2 entries per qual (original + lowercase key)
+        let mut qual_params: HashMap<String, String> = HashMap::with_capacity(quals.len() * 2);
+        for qual in &quals {
+            if let Some(value) = Self::qual_value_to_string(qual) {
+                // Store both original and lowercase versions for flexible matching
+                qual_params.insert(qual.field().to_lowercase(), value.clone());
+                qual_params.insert(qual.field(), value);
+            }
+        }
+
         // Substitute path parameters (no self borrow — takes &mut injected_params directly)
         let (endpoint, path_params_used) =
-            Self::substitute_path_params(&self.endpoint, &quals, &mut self.injected_params)?;
+            Self::substitute_path_params(&self.endpoint, &qual_params, &mut self.injected_params)?;
 
         // Store resolved endpoint for pagination (query-only URLs need the
         // substituted path, not the raw template with {param} placeholders).
@@ -432,25 +447,42 @@ impl OpenApiFdw {
         Ok(url)
     }
 
+    /// Assemble request headers: configured headers plus the dynamic
+    /// session token (auth_token_setting), if one resolves at request time.
+    pub(crate) fn build_request_headers(&self) -> Vec<(String, String)> {
+        let mut headers = self.config.headers.clone();
+        if let Some(ref setting_name) = self.config.auth_token_setting
+            && let Some(token) = utils::query_setting(setting_name)
+        {
+            ServerConfig::apply_session_token(&mut headers, &token, &self.config.auth_token_prefix);
+        }
+        headers
+    }
+
+    /// Dispatch a request to the host exactly once, by verb.
+    ///
+    /// The write path calls this directly with no guest retry loop: the host's
+    /// HTTP middleware already retries transient failures up to 3 times, and
+    /// wrapping writes in the read path's retry loop would compound that to up
+    /// to nine re-sends of a single non-idempotent POST/PATCH.
+    pub(crate) fn send_once(req: &http::Request) -> Result<http::Response, FdwError> {
+        match req.method {
+            http::Method::Get => http::get(req),
+            http::Method::Post => http::post(req),
+            http::Method::Put => http::put(req),
+            http::Method::Patch => http::patch(req),
+            http::Method::Delete => http::delete(req),
+        }
+    }
+
     /// Make a request to the API with automatic rate limit handling
     pub(crate) fn make_request(&mut self, ctx: &Context) -> FdwResult {
         let url = self.build_url(ctx)?;
 
-        let mut headers = self.config.headers.clone();
-        if let Some(ref setting_name) = self.config.auth_token_setting {
-            if let Some(token) = utils::query_setting(setting_name) {
-                ServerConfig::apply_session_token(
-                    &mut headers,
-                    &token,
-                    &self.config.auth_token_prefix,
-                );
-            }
-        }
-
         let req = http::Request {
             method: self.method,
             url,
-            headers,
+            headers: self.build_request_headers(),
             body: self.request_body.clone(),
         };
 
@@ -459,10 +491,7 @@ impl OpenApiFdw {
         const MAX_RETRIES: u32 = 3;
 
         let resp = loop {
-            let resp = match req.method {
-                http::Method::Post => http::post(&req)?,
-                _ => http::get(&req)?,
-            };
+            let resp = Self::send_once(&req)?;
 
             let is_retryable = matches!(resp.status_code, 429 | 502 | 503);
             if is_retryable {
@@ -503,11 +532,7 @@ impl OpenApiFdw {
             };
             utils::report_info(&format!(
                 "[openapi_fdw] HTTP {} {} -> {} ({} bytes)",
-                if matches!(req.method, http::Method::Post) {
-                    "POST"
-                } else {
-                    "GET"
-                },
+                method_label(req.method),
                 log_url,
                 resp.status_code,
                 resp.body.len()
