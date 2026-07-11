@@ -764,6 +764,26 @@ fn test_build_write_url_no_double_append_when_template_has_rowid() {
 }
 
 #[test]
+fn test_build_write_url_no_double_placement_query_when_template_has_rowid() {
+    // '/records/{id}' already places the rowid in the path; Query location
+    // must not also append it as a query parameter.
+    let fdw = fdw_with_base_url("https://api.example.com");
+    let mut params = HashMap::new();
+    params.insert("id".to_string(), "i-1".to_string());
+    let (url, _) = fdw
+        .build_write_url(
+            "/records/{id}",
+            &params,
+            Some("i-1"),
+            RowidLocation::Query,
+            "id",
+            "ids",
+        )
+        .unwrap();
+    assert_eq!(url, "https://api.example.com/records/i-1");
+}
+
+#[test]
 fn test_build_write_url_appends_api_key_query() {
     let mut fdw = fdw_with_base_url("https://api.example.com");
     fdw.config.api_key_query = Some(("api_key".to_string(), "sk_test".to_string()));

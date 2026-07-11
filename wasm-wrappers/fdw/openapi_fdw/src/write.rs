@@ -551,7 +551,7 @@ impl OpenApiFdw {
     /// places the rowid per rowid_location, and appends the API key query
     /// parameter exactly like the read path. When the endpoint template
     /// already consumed the rowid as a {param} (e.g. '/records/{id}'), the
-    /// Url location does not append it a second time.
+    /// Url and Query locations do not place it a second time.
     ///
     /// Returns (url, path_params_consumed) where path_params_consumed holds
     /// lowercase column names substituted into the path (excluded from the
@@ -581,7 +581,9 @@ impl OpenApiFdw {
                     None => format!("{base}{resolved}/{encoded}"),
                 }
             }
-            (Some(id), RowidLocation::Query) => {
+            (Some(id), RowidLocation::Query)
+                if !consumed.contains(&rowid_column.to_lowercase()) =>
+            {
                 let separator = if resolved.contains('?') { '&' } else { '?' };
                 format!(
                     "{base}{resolved}{separator}{}={}",
