@@ -8,11 +8,11 @@ Query the [Weather.gov API](https://www.weather.gov/documentation/services-web-a
 create server nws
   foreign data wrapper wasm_wrapper
   options (
-    fdw_package_url 'https://github.com/supabase/wrappers/releases/download/wasm_openapi_fdw_v0.2.0/openapi_fdw.wasm',
+    fdw_package_url 'https://github.com/supabase/wrappers/releases/download/wasm_openapi_fdw_v0.3.0/openapi_fdw.wasm',
     fdw_package_name 'supabase:openapi-fdw',
-    fdw_package_version '0.2.0',
+    fdw_package_version '0.3.0',
     base_url 'https://api.weather.gov',
-    user_agent 'openapi-fdw-example/0.2.0',
+    user_agent 'openapi-fdw-example/0.3.0',
     accept 'application/geo+json'
   );
 ```
@@ -27,11 +27,11 @@ The `nws_import` server has a `spec_url` pointing to the Weather.gov OpenAPI spe
 create server nws_import
   foreign data wrapper wasm_wrapper
   options (
-    fdw_package_url 'https://github.com/supabase/wrappers/releases/download/wasm_openapi_fdw_v0.2.0/openapi_fdw.wasm',
+    fdw_package_url 'https://github.com/supabase/wrappers/releases/download/wasm_openapi_fdw_v0.3.0/openapi_fdw.wasm',
     fdw_package_name 'supabase:openapi-fdw',
-    fdw_package_version '0.2.0',
+    fdw_package_version '0.3.0',
     base_url 'https://api.weather.gov',
-    user_agent 'openapi-fdw-example/0.2.0',
+    user_agent 'openapi-fdw-example/0.3.0',
     accept 'application/geo+json',
     spec_url 'https://api.weather.gov/openapi.json',
     page_size '50',

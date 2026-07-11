@@ -367,6 +367,14 @@ values ('octocat', 'hello', 7, 'Thanks, merging.');
 -- POST /repos/octocat/hello/issues/7/comments   body: {"body":"Thanks, merging."}
 ```
 
+!!! note "Path parameters on UPDATE and DELETE"
+
+    INSERT can substitute any `{param}` placeholder from the inserted row, as above. UPDATE and DELETE cannot: PostgreSQL hands the FDW only the SET columns plus the rowid, so the only placeholder a write endpoint can fill from the row is the rowid column itself (as in `/records/{id}`). Any other path parameter must be written statically into the endpoint option (as in the `gh_pulls` example above), or included in the SET list.
+
+!!! warning "Filter UPDATE and DELETE by the rowid column"
+
+    The scan that selects rows to modify optimistically pushes equality filters as query parameters and injects the filtered value back into returned rows so PostgreSQL's re-check passes. If the API ignores the parameter (for example `where title = '...'` against an endpoint with no `title` filter), the scan matches **every** row, and the statement modifies all of them. Filter writes by `rowid_column` or by parameters the API genuinely supports; to filter locally on other fields, use the `attrs` column (`attrs->>'title' = '...'`), which is never pushed down or injected.
+
 ### Rowid placement
 
 `rowid_location` controls where the record id goes on UPDATE/DELETE: appended to the URL path (`url`, the default), injected into the JSON body under `rowid_body_key` (`body`), or sent as a query parameter named `rowid_param` (`query`). Per-verb overrides (`update_rowid_location`, `delete_rowid_location`) express APIs that mix placements on a single resource.
@@ -678,10 +686,10 @@ A server's credential is normally fixed when the server is created. To vary it p
 create server per_user_api
   foreign data wrapper wasm_wrapper
   options (
-    fdw_package_url 'https://github.com/supabase/wrappers/releases/download/wasm_openapi_fdw_v0.2.0/openapi_fdw.wasm',
+    fdw_package_url 'https://github.com/supabase/wrappers/releases/download/wasm_openapi_fdw_v0.2.1/openapi_fdw.wasm',
     fdw_package_name 'supabase:openapi-fdw',
-    fdw_package_version '0.2.0',
-    fdw_package_checksum 'f0d4d6e50f7c519a66363bd8bdbe1ea8086ca810ca14b43fb0ed18b64acdf6aa',
+    fdw_package_version '0.2.1',
+    fdw_package_checksum '12c902f3089e18142a1d8d35c66b9ceb85c193224229687bd929aff6b44cddde',
     base_url 'https://api.example.com',
     auth_token_setting 'app.api_token'  -- read the token from this session variable each request
   );

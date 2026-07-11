@@ -28,9 +28,9 @@ You need a Meta Threads access token. To get one:
 create server threads
   foreign data wrapper wasm_wrapper
   options (
-    fdw_package_url 'https://github.com/supabase/wrappers/releases/download/wasm_openapi_fdw_v0.2.0/openapi_fdw.wasm',
+    fdw_package_url 'https://github.com/supabase/wrappers/releases/download/wasm_openapi_fdw_v0.3.0/openapi_fdw.wasm',
     fdw_package_name 'supabase:openapi-fdw',
-    fdw_package_version '0.2.0',
+    fdw_package_version '0.3.0',
     base_url 'https://graph.threads.net',
     api_key '<YOUR_ACCESS_TOKEN>',
     api_key_header 'access_token',
@@ -56,7 +56,7 @@ create server threads_import
   options (
     fdw_package_url '...openapi_fdw.wasm',
     fdw_package_name 'supabase:openapi-fdw',
-    fdw_package_version '0.2.0',
+    fdw_package_version '0.3.0',
     base_url 'https://graph.threads.net',
     api_key '<YOUR_ACCESS_TOKEN>',
     api_key_header 'access_token',

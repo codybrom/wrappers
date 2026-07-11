@@ -8,12 +8,12 @@ Query the [GitHub REST API](https://docs.github.com/en/rest) using SQL. This exa
 create server github
   foreign data wrapper wasm_wrapper
   options (
-    fdw_package_url 'https://github.com/supabase/wrappers/releases/download/wasm_openapi_fdw_v0.2.0/openapi_fdw.wasm',
+    fdw_package_url 'https://github.com/supabase/wrappers/releases/download/wasm_openapi_fdw_v0.3.0/openapi_fdw.wasm',
     fdw_package_name 'supabase:openapi-fdw',
-    fdw_package_version '0.2.0',
+    fdw_package_version '0.3.0',
     base_url 'https://api.github.com',
     api_key '<YOUR_GITHUB_TOKEN>',
-    user_agent 'openapi-fdw-example/0.2.0',
+    user_agent 'openapi-fdw-example/0.3.0',
     accept 'application/vnd.github+json',
     headers '{"X-GitHub-Api-Version": "2022-11-28"}',
     page_size '30',
@@ -33,12 +33,12 @@ The `github_import` server has a `spec_url` pointing to the GitHub REST API Open
 create server github_import
   foreign data wrapper wasm_wrapper
   options (
-    fdw_package_url 'https://github.com/supabase/wrappers/releases/download/wasm_openapi_fdw_v0.2.0/openapi_fdw.wasm',
+    fdw_package_url 'https://github.com/supabase/wrappers/releases/download/wasm_openapi_fdw_v0.3.0/openapi_fdw.wasm',
     fdw_package_name 'supabase:openapi-fdw',
-    fdw_package_version '0.2.0',
+    fdw_package_version '0.3.0',
     base_url 'https://api.github.com',
     api_key '<YOUR_GITHUB_TOKEN>',
-    user_agent 'openapi-fdw-example/0.2.0',
+    user_agent 'openapi-fdw-example/0.3.0',
     accept 'application/vnd.github+json',
     headers '{"X-GitHub-Api-Version": "2022-11-28"}',
     page_size '30',
@@ -540,3 +540,102 @@ LIMIT 3;
 | my-project | public | true |
 | dotfiles | public | false |
 | cool-app | public | true |
+
+## 11. Per-Request Credentials (Session Variables)
+
+The `github_session` server stores **no** static token. Instead, `auth_token_setting 'app.github_token'` makes the FDW read the bearer token from a Postgres session variable on every request:
+
+```sql
+create server github_session
+  foreign data wrapper wasm_wrapper
+  options (
+    fdw_package_url 'https://github.com/supabase/wrappers/releases/download/wasm_openapi_fdw_v0.3.0/openapi_fdw.wasm',
+    fdw_package_name 'supabase:openapi-fdw',
+    fdw_package_version '0.3.0',
+    base_url 'https://api.github.com',
+    user_agent 'openapi-fdw-example/0.3.0',
+    accept 'application/vnd.github+json',
+    headers '{"X-GitHub-Api-Version": "2022-11-28"}',
+    page_size '30',
+    page_size_param 'per_page',
+    auth_token_setting 'app.github_token'
+  );
+
+create foreign table session_profile (
+  login text,
+  id bigint,
+  name text,
+  attrs jsonb
+)
+  server github_session
+  options (
+    endpoint '/user'
+  );
+```
+
+Without a token the query fails with HTTP 401. Supply one for the current session and it succeeds:
+
+```sql
+SELECT login FROM session_profile;
+-- ERROR: HTTP 401 error from API endpoint (/user)
+
+SELECT set_config('app.github_token', '<YOUR_GITHUB_TOKEN>', false);
+SELECT login FROM session_profile;   -- now authenticated as you
+```
+
+In a multi-tenant app, wrap the `set_config` in a `SECURITY DEFINER` function that resolves the calling user's token — see [Per-request credentials](https://fdw.dev/catalog/openapi/#per-request-credentials-session-variables) in the docs.
+
+## 12. Writing to GitHub (INSERT / UPDATE)
+
+> **These writes are real.** Point them at a sandbox repository you own. Writes are per-row, immediate, and cannot be rolled back.
+
+The full lifecycle — create an issue, find it, edit it, comment on it, close it — needs no ids up front. `new_issues` creates via `POST` to the collection endpoint:
+
+```sql
+INSERT INTO new_issues (owner, repo, title, body)
+VALUES ('youruser', 'sandbox', 'Created from SQL', 'Opened through the OpenAPI FDW.');
+-- POST /repos/youruser/sandbox/issues   body: {"title":"Created from SQL","body":"Opened through the OpenAPI FDW."}
+```
+
+`RETURNING` is unsupported, so the new issue's number isn't visible to the INSERT statement — GitHub assigns it server-side and returns it only in the response body. Re-select by a title you control to pick it up (the create-then-reference pattern from the [Data Modify docs](https://fdw.dev/catalog/openapi/#data-modify-insert-update-delete)):
+
+```sql
+SELECT number FROM repo_issues
+WHERE owner = 'youruser' AND repo = 'sandbox'
+  AND attrs->>'title' = 'Created from SQL';
+```
+
+> **Filter through `attrs`, not the plain column, when the API can't filter for you.** A simple `title = '...'` qual is optimistically pushed as a `?title=...` query parameter — which GitHub ignores — and the FDW injects the qual value back into every returned row so PostgreSQL's re-check passes. The result would match *every* issue. The `attrs->>'title'` expression is never pushed down or injected, so PostgreSQL evaluates it locally against the real response data.
+
+`issue_editor` updates an issue via `PATCH`. UPDATE rows carry only the SET columns plus the rowid, so the only path parameter a *write* endpoint can substitute from the row is the rowid itself — `owner` and `repo` are static in the endpoint option:
+
+```sql
+create foreign table issue_editor ( ... )
+  server github
+  options (
+    endpoint '/repos/youruser/sandbox/issues/{issue_number}',
+    rowid_column 'issue_number',
+    writable 'true',
+    update_method 'PATCH'
+  );
+
+UPDATE issue_editor SET title = 'Updated from SQL' WHERE issue_number = 42;
+-- PATCH /repos/youruser/sandbox/issues/42   body: {"title":"Updated from SQL"}
+
+-- state is just another column; closing an issue is an UPDATE too:
+UPDATE issue_editor SET state = 'closed' WHERE issue_number = 42;
+```
+
+(INSERT is different: the inserted row provides every column, so parameterized endpoints like `new_issues`' `/repos/{owner}/{repo}/issues` substitute freely on INSERT.)
+
+`issue_comments` inserts a comment via `POST .../comments` — the path-parameter columns are consumed by the URL and excluded from the body:
+
+```sql
+INSERT INTO issue_comments (owner, repo, issue_number, body)
+VALUES ('youruser', 'sandbox', 42, 'Posted through the OpenAPI FDW.');
+-- POST /repos/youruser/sandbox/issues/42/comments   body: {"body":"Posted through the OpenAPI FDW."}
+```
+
+GitHub's plain-JSON, id-in-URL style needs no envelope or body-check options. For APIs that signal failure inside 2xx responses, see the [httpbin example](../httpbin/) and the [Data Modify docs](https://fdw.dev/catalog/openapi/#data-modify-insert-update-delete).
+
+The test harness (`test/run-examples.sh github`) runs exactly this lifecycle against the sandbox repo named by `GITHUB_WRITE_OWNER`/`GITHUB_WRITE_REPO` in `test/.env`: it creates one marker-titled issue, discovers its number by re-selecting, updates it, comments on it, and closes it — touching nothing pre-existing.

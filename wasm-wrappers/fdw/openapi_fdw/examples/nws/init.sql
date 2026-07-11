@@ -1,7 +1,7 @@
 -- OpenAPI FDW example: National Weather Service API
 -- All queries hit the live NWS API (no auth required).
 -- Note: fdw_package_url uses file:// for local Docker testing. In production, use the
--- GitHub release URL: https://github.com/supabase/wrappers/releases/download/wasm_openapi_fdw_v0.2.0/openapi_fdw.wasm
+-- GitHub release URL: https://github.com/supabase/wrappers/releases/download/wasm_openapi_fdw_v0.3.0/openapi_fdw.wasm
 
 -- Create supabase_admin role if it doesn't exist (required by wrappers extension)
 DO $$
@@ -29,9 +29,9 @@ create server nws
   options (
     fdw_package_url 'file:///openapi_fdw.wasm',
     fdw_package_name 'supabase:openapi-fdw',
-    fdw_package_version '0.2.0',
+    fdw_package_version '0.3.0',
     base_url 'https://api.weather.gov',
-    user_agent 'openapi-fdw-example/0.2.0',
+    user_agent 'openapi-fdw-example/0.3.0',
     accept 'application/geo+json'
   );
 
@@ -43,9 +43,9 @@ create server nws_debug
   options (
     fdw_package_url 'file:///openapi_fdw.wasm',
     fdw_package_name 'supabase:openapi-fdw',
-    fdw_package_version '0.2.0',
+    fdw_package_version '0.3.0',
     base_url 'https://api.weather.gov',
-    user_agent 'openapi-fdw-example/0.2.0',
+    user_agent 'openapi-fdw-example/0.3.0',
     accept 'application/geo+json',
     debug 'true'
   );
@@ -58,9 +58,9 @@ create server nws_import
   options (
     fdw_package_url 'file:///openapi_fdw.wasm',
     fdw_package_name 'supabase:openapi-fdw',
-    fdw_package_version '0.2.0',
+    fdw_package_version '0.3.0',
     base_url 'https://api.weather.gov',
-    user_agent 'openapi-fdw-example/0.2.0',
+    user_agent 'openapi-fdw-example/0.3.0',
     accept 'application/geo+json',
     spec_url 'https://api.weather.gov/openapi.json',
     page_size '50',

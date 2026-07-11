@@ -3,7 +3,7 @@
 -- with your token, or see the README for how to obtain one.
 -- See: https://developers.facebook.com/docs/threads
 -- Note: fdw_package_url uses file:// for local Docker testing. In production, use the
--- GitHub release URL: https://github.com/supabase/wrappers/releases/download/wasm_openapi_fdw_v0.2.0/openapi_fdw.wasm
+-- GitHub release URL: https://github.com/supabase/wrappers/releases/download/wasm_openapi_fdw_v0.3.0/openapi_fdw.wasm
 
 -- Create supabase_admin role if it doesn't exist (required by wrappers extension)
 DO $$
@@ -32,7 +32,7 @@ create server threads
   options (
     fdw_package_url 'file:///openapi_fdw.wasm',
     fdw_package_name 'supabase:openapi-fdw',
-    fdw_package_version '0.2.0',
+    fdw_package_version '0.3.0',
     base_url 'https://graph.threads.net',
     api_key 'placeholder',
     api_key_header 'access_token',
@@ -47,7 +47,7 @@ create server threads_debug
   options (
     fdw_package_url 'file:///openapi_fdw.wasm',
     fdw_package_name 'supabase:openapi-fdw',
-    fdw_package_version '0.2.0',
+    fdw_package_version '0.3.0',
     base_url 'https://graph.threads.net',
     api_key 'placeholder',
     api_key_header 'access_token',
@@ -63,7 +63,7 @@ create server threads_import
   options (
     fdw_package_url 'file:///openapi_fdw.wasm',
     fdw_package_name 'supabase:openapi-fdw',
-    fdw_package_version '0.2.0',
+    fdw_package_version '0.3.0',
     base_url 'https://graph.threads.net',
     api_key 'placeholder',
     api_key_header 'access_token',

@@ -1,7 +1,7 @@
 -- OpenAPI FDW example: PokéAPI
 -- All queries hit the live PokéAPI (no auth required).
 -- Note: fdw_package_url uses file:// for local Docker testing. In production, use the
--- GitHub release URL: https://github.com/supabase/wrappers/releases/download/wasm_openapi_fdw_v0.2.0/openapi_fdw.wasm
+-- GitHub release URL: https://github.com/supabase/wrappers/releases/download/wasm_openapi_fdw_v0.3.0/openapi_fdw.wasm
 
 -- Create supabase_admin role if it doesn't exist (required by wrappers extension)
 DO $$
@@ -29,7 +29,7 @@ create server pokeapi
   options (
     fdw_package_url 'file:///openapi_fdw.wasm',
     fdw_package_name 'supabase:openapi-fdw',
-    fdw_package_version '0.2.0',
+    fdw_package_version '0.3.0',
     base_url 'https://pokeapi.co/api/v2',
     page_size '20',
     page_size_param 'limit'
@@ -43,7 +43,7 @@ create server pokeapi_debug
   options (
     fdw_package_url 'file:///openapi_fdw.wasm',
     fdw_package_name 'supabase:openapi-fdw',
-    fdw_package_version '0.2.0',
+    fdw_package_version '0.3.0',
     base_url 'https://pokeapi.co/api/v2',
     page_size '20',
     page_size_param 'limit',
@@ -58,7 +58,7 @@ create server pokeapi_import
   options (
     fdw_package_url 'file:///openapi_fdw.wasm',
     fdw_package_name 'supabase:openapi-fdw',
-    fdw_package_version '0.2.0',
+    fdw_package_version '0.3.0',
     base_url 'https://pokeapi.co/api/v2',
     spec_url 'https://raw.githubusercontent.com/PokeAPI/pokeapi/master/openapi.yml',
     page_size '20',

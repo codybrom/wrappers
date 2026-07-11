@@ -14,7 +14,7 @@ WASM_BIN="../target/wasm32-unknown-unknown/release/openapi_fdw.wasm"
 
 CLEANUP=true
 EXAMPLES=()
-ALL_EXAMPLES=(nws carapi pokeapi github threads)
+ALL_EXAMPLES=(nws carapi pokeapi jsonplaceholder httpbin github threads)
 COMPOSE="test/docker-compose.yml"
 
 while [[ $# -gt 0 ]]; do
@@ -185,6 +185,14 @@ load_example() {
         ALTER SERVER github OPTIONS (SET api_key '${GITHUB_TOKEN}');
         ALTER SERVER github_debug OPTIONS (SET api_key '${GITHUB_TOKEN}');
       " > /dev/null 2>&1
+      # issue_editor's endpoint must carry the sandbox owner/repo statically:
+      # UPDATE rows contain only the SET columns plus the rowid, so only the
+      # rowid ({issue_number}) can be substituted from the row on writes.
+      if [ -n "${GITHUB_WRITE_OWNER:-}" ] && [ -n "${GITHUB_WRITE_REPO:-}" ]; then
+        psql_cmd -c "
+          ALTER FOREIGN TABLE issue_editor OPTIONS (SET endpoint '/repos/${GITHUB_WRITE_OWNER}/${GITHUB_WRITE_REPO}/issues/{issue_number}');
+        " > /dev/null 2>&1
+      fi
       ;;
     threads)
       psql_cmd -c "
@@ -422,6 +430,98 @@ verify_pokeapi() {
     "HTTP GET"
 }
 
+verify_jsonplaceholder() {
+  echo "=== JSONPlaceholder (write support) ==="
+  echo ""
+
+  echo "Reads:"
+  run_test "Basic read" \
+    "SELECT id, title FROM posts LIMIT 5;" \
+    "(5 rows)"
+  run_test "Single lookup by rowid" \
+    "SELECT title FROM posts WHERE id = 1;" \
+    "sunt aut facere"
+  run_test "camelCase userId -> user_id" \
+    "SELECT user_id FROM posts WHERE id = 1 AND user_id IS NOT NULL;" \
+    "(1 row)"
+  run_count_test "Users list" \
+    "SELECT count(*) FROM users;" \
+    10
+
+  echo ""
+  echo "Writes (INSERT / UPDATE / DELETE):"
+  run_test "INSERT -> POST /posts" \
+    "INSERT INTO posts (user_id, title, body) VALUES (1, 'fdw write test', 'hello');" \
+    "INSERT 0 1"
+  run_test "UPDATE -> PATCH /posts/1" \
+    "UPDATE posts SET title = 'updated by fdw' WHERE id = 1;" \
+    "UPDATE 1"
+  run_test "DELETE -> DELETE /posts/1" \
+    "DELETE FROM posts WHERE id = 1;" \
+    "DELETE 1"
+
+  echo ""
+  echo "Body-level success checking:"
+  run_test "success_path match passes" \
+    "INSERT INTO posts_checked (title, body) VALUES ('t', 'b');" \
+    "INSERT 0 1"
+  run_test "success_path mismatch aborts" \
+    "INSERT INTO posts_wrong_check (title, body) VALUES ('t', 'b');" \
+    "did not match expected value"
+
+  echo ""
+  echo "Write gates:"
+  run_test "non-writable table rejected" \
+    "INSERT INTO posts_readonly (title) VALUES ('t');" \
+    "read-only"
+
+  echo ""
+  echo "Debug mode (write verbs):"
+  run_test "HTTP POST logged" \
+    "INSERT INTO posts_debug (title, body) VALUES ('t', 'b');" \
+    "HTTP POST"
+  run_test "HTTP PATCH logged" \
+    "UPDATE posts_debug SET title = 'renamed' WHERE id = 2;" \
+    "HTTP PATCH"
+}
+
+verify_httpbin() {
+  echo "=== httpbin (advanced write shapes) ==="
+  echo ""
+
+  echo "Envelope UPDATE (self-verifying echo):"
+  run_test "PUT {\"data\":[{...}]} + body rowid" \
+    "UPDATE echo_update SET stage = 'Qualification', amount = 8000 WHERE id = 'rec-1';" \
+    "UPDATE 1"
+
+  echo ""
+  echo "write_endpoint routing:"
+  run_test "INSERT routed to write endpoint" \
+    "INSERT INTO echo_insert (name) VALUES ('routed');" \
+    "INSERT 0 1"
+
+  echo ""
+  echo "Query-param rowid DELETE:"
+  run_test "DELETE with ?ids=<rowid>" \
+    "DELETE FROM echo_delete WHERE id = 'del-1';" \
+    "DELETE 1"
+  run_test "Debug URL shows ids=del-1" \
+    "DELETE FROM echo_delete WHERE id = 'del-1';" \
+    "ids=del-1"
+  run_test "HTTP DELETE logged" \
+    "DELETE FROM echo_delete WHERE id = 'del-1';" \
+    "HTTP DELETE"
+
+  echo ""
+  echo "Misconfiguration gates (no HTTP issued):"
+  run_test "disabled op rejected" \
+    "INSERT INTO echo_update (id, stage) VALUES ('x', 'y');" \
+    "INSERT is not enabled"
+  run_test "envelope requires success_path" \
+    "UPDATE echo_missing_check SET name = 'x' WHERE id = 'm-1';" \
+    "success_path"
+}
+
 verify_github() {
   echo "=== GitHub API ==="
   echo ""
@@ -478,6 +578,65 @@ verify_github() {
   run_test "HTTP request details" \
     "SELECT id FROM search_repos_debug WHERE q = 'supabase' LIMIT 1;" \
     "HTTP GET"
+
+  echo ""
+  echo "Link-header pagination (RFC 8288, 0.2.1+):"
+  run_count_test "45 rows span multiple pages" \
+    "SELECT count(*) FROM (SELECT 1 FROM repo_pulls WHERE owner = 'supabase' AND repo = 'wrappers' AND state = 'all' LIMIT 45) t;" \
+    31
+
+  echo ""
+  echo "Session-variable auth (auth_token_setting, 0.2.1+):"
+  run_test "no token -> HTTP 401" \
+    "SELECT login FROM session_profile;" \
+    "401"
+  run_test "token from session variable" \
+    "SELECT set_config('app.github_token', '${GITHUB_TOKEN}', false); SELECT 'SESSION_AUTH_OK' FROM session_profile;" \
+    "SESSION_AUTH_OK"
+
+  echo ""
+  echo "Live writes (0.3.0+):"
+  if [ -n "${GITHUB_WRITE_OWNER:-}" ] && [ -n "${GITHUB_WRITE_REPO:-}" ]; then
+    # Full issue lifecycle against the sandbox repo, touching nothing
+    # pre-existing: create a marker-titled issue through the FDW, discover
+    # its number by re-selecting (RETURNING is unsupported — this is the
+    # documented create-then-reference pattern), then update, comment, and
+    # close that issue.
+    local marker="openapi_fdw live validation $(date +%s)"
+    run_test "INSERT issue via POST" \
+      "INSERT INTO new_issues (owner, repo, title, body) VALUES ('${GITHUB_WRITE_OWNER}', '${GITHUB_WRITE_REPO}', '${marker}', 'Created by test/run-examples.sh; will be closed by the same run.');" \
+      "INSERT 0 1"
+
+    printf "  %-40s " "Re-select created issue number"
+    # Filter on attrs->>'title', NOT the title column: a plain title = '...'
+    # qual is pushed as a query parameter (which GitHub ignores) and injected
+    # back into every row, so it would match everything. The jsonb expression
+    # is evaluated locally by Postgres against the real response data.
+    local issue_num=""
+    for _ in 1 2 3; do
+      issue_num=$(psql_cmd -t -c "SELECT number FROM repo_issues WHERE owner = '${GITHUB_WRITE_OWNER}' AND repo = '${GITHUB_WRITE_REPO}' AND attrs->>'title' = '${marker}' LIMIT 1;" 2>/dev/null | tr -d ' \n')
+      [ -n "$issue_num" ] && break
+      sleep 2
+    done
+    if [ -n "$issue_num" ]; then
+      echo "PASS (#$issue_num)"
+      PASS=$((PASS + 1))
+      run_test "UPDATE issue via PATCH" \
+        "UPDATE issue_editor SET body = 'openapi_fdw write-support live validation (UPDATE)' WHERE issue_number = ${issue_num};" \
+        "UPDATE 1"
+      run_test "INSERT comment via POST" \
+        "INSERT INTO issue_comments (owner, repo, issue_number, body) VALUES ('${GITHUB_WRITE_OWNER}', '${GITHUB_WRITE_REPO}', ${issue_num}, 'openapi_fdw write-support live validation (comment INSERT)');" \
+        "INSERT 0 1"
+      run_test "Close issue via PATCH" \
+        "UPDATE issue_editor SET state = 'closed' WHERE issue_number = ${issue_num};" \
+        "UPDATE 1"
+    else
+      echo "FAIL (created issue not found by title)"
+      FAIL=$((FAIL + 1))
+    fi
+  else
+    echo "  SKIP (set GITHUB_WRITE_OWNER/GITHUB_WRITE_REPO in test/.env to run real writes against a sandbox repo you own)"
+  fi
 }
 
 verify_threads() {

@@ -3,7 +3,7 @@
 -- below with your token.
 -- See: https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens
 -- Note: fdw_package_url uses file:// for local Docker testing. In production, use the
--- GitHub release URL: https://github.com/supabase/wrappers/releases/download/wasm_openapi_fdw_v0.2.0/openapi_fdw.wasm
+-- GitHub release URL: https://github.com/supabase/wrappers/releases/download/wasm_openapi_fdw_v0.3.0/openapi_fdw.wasm
 
 -- Create supabase_admin role if it doesn't exist (required by wrappers extension)
 DO $$
@@ -33,10 +33,10 @@ create server github
   options (
     fdw_package_url 'file:///openapi_fdw.wasm',
     fdw_package_name 'supabase:openapi-fdw',
-    fdw_package_version '0.2.0',
+    fdw_package_version '0.3.0',
     base_url 'https://api.github.com',
     api_key 'placeholder',
-    user_agent 'openapi-fdw-example/0.2.0',
+    user_agent 'openapi-fdw-example/0.3.0',
     accept 'application/vnd.github+json',
     headers '{"X-GitHub-Api-Version": "2022-11-28"}',
     page_size '30',
@@ -52,10 +52,10 @@ create server github_debug
   options (
     fdw_package_url 'file:///openapi_fdw.wasm',
     fdw_package_name 'supabase:openapi-fdw',
-    fdw_package_version '0.2.0',
+    fdw_package_version '0.3.0',
     base_url 'https://api.github.com',
     api_key 'placeholder',
-    user_agent 'openapi-fdw-example/0.2.0',
+    user_agent 'openapi-fdw-example/0.3.0',
     accept 'application/vnd.github+json',
     headers '{"X-GitHub-Api-Version": "2022-11-28"}',
     page_size '30',
@@ -74,15 +74,36 @@ create server github_import
   options (
     fdw_package_url 'file:///openapi_fdw.wasm',
     fdw_package_name 'supabase:openapi-fdw',
-    fdw_package_version '0.2.0',
+    fdw_package_version '0.3.0',
     base_url 'https://api.github.com',
     api_key 'placeholder',
-    user_agent 'openapi-fdw-example/0.2.0',
+    user_agent 'openapi-fdw-example/0.3.0',
     accept 'application/vnd.github+json',
     headers '{"X-GitHub-Api-Version": "2022-11-28"}',
     page_size '30',
     page_size_param 'per_page',
     spec_url 'https://raw.githubusercontent.com/github/rest-api-description/main/descriptions/api.github.com/api.github.com.json'
+  );
+
+-- ============================================================
+-- Server 4: github_session — Per-request credentials (0.2.1+)
+-- No static api_key: the bearer token is read from the Postgres
+-- session variable 'app.github_token' on every request, so each
+-- session (or user, via a SECURITY DEFINER helper) supplies its own.
+-- ============================================================
+create server github_session
+  foreign data wrapper wasm_wrapper
+  options (
+    fdw_package_url 'file:///openapi_fdw.wasm',
+    fdw_package_name 'supabase:openapi-fdw',
+    fdw_package_version '0.3.0',
+    base_url 'https://api.github.com',
+    user_agent 'openapi-fdw-example/0.3.0',
+    accept 'application/vnd.github+json',
+    headers '{"X-GitHub-Api-Version": "2022-11-28"}',
+    page_size '30',
+    page_size_param 'per_page',
+    auth_token_setting 'app.github_token'
   );
 
 -- ============================================================
@@ -302,4 +323,93 @@ create foreign table search_repos_debug (
   options (
     endpoint '/search/repositories',
     rowid_column 'id'
+  );
+
+-- ============================================================
+-- Table 9: session_profile
+-- Same as my_profile but on the session-variable auth server (0.2.1+).
+-- Queries fail with HTTP 401 until the session supplies a token:
+--   SELECT set_config('app.github_token', '<token>', false);
+-- ============================================================
+create foreign table session_profile (
+  login text,
+  id bigint,
+  name text,
+  attrs jsonb
+)
+  server github_session
+  options (
+    endpoint '/user'
+  );
+
+-- ============================================================
+-- Table 10: issue_editor
+-- Live write support (0.3.0+): UPDATE an issue via PATCH.
+-- UPDATE rows carry only the SET columns plus the rowid, so the only
+-- path parameter a write endpoint can substitute from the row is the
+-- rowid itself ({issue_number} here). Owner and repo must be static in
+-- the endpoint — replace 'youruser/sandbox' with a repo you own (the
+-- test harness rewrites it from GITHUB_WRITE_OWNER/GITHUB_WRITE_REPO).
+-- Only the SET columns (title, body, state) travel in the JSON body.
+-- ============================================================
+create foreign table issue_editor (
+  issue_number bigint,
+  title text,
+  body text,
+  state text,
+  attrs jsonb
+)
+  server github
+  options (
+    endpoint '/repos/youruser/sandbox/issues/{issue_number}',
+    rowid_column 'issue_number',
+    writable 'true',
+    update_method 'PATCH'
+  );
+
+-- ============================================================
+-- Table 11: issue_comments
+-- Live write support (0.3.0+): INSERT a comment via POST.
+-- owner/repo/issue_number are consumed as path parameters and excluded
+-- from the body, which carries only {"body": "..."}.
+-- ============================================================
+create foreign table issue_comments (
+  id bigint,
+  owner text,
+  repo text,
+  issue_number bigint,
+  body text,
+  created_at timestamptz,
+  attrs jsonb
+)
+  server github
+  options (
+    endpoint '/repos/{owner}/{repo}/issues/{issue_number}/comments',
+    rowid_column 'id',
+    writable 'true',
+    insert_method 'POST'
+  );
+
+-- ============================================================
+-- Table 12: new_issues
+-- Live write support (0.3.0+): CREATE an issue via POST.
+-- The collection endpoint (no {issue_number}) is the create URL.
+-- RETURNING is unsupported, so the created issue's number is not
+-- visible to SQL — re-select repo_issues by a unique title to find it
+-- (the create-then-reference pattern from the Data Modify docs).
+-- ============================================================
+create foreign table new_issues (
+  id bigint,
+  owner text,
+  repo text,
+  title text,
+  body text,
+  attrs jsonb
+)
+  server github
+  options (
+    endpoint '/repos/{owner}/{repo}/issues',
+    rowid_column 'id',
+    writable 'true',
+    insert_method 'POST'
   );

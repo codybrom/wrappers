@@ -64,14 +64,16 @@ SELECT * FROM openapi.users WHERE id = '123';
 
 ## Examples
 
-The [`examples/`](examples/) directory has complete working setups for 5 real APIs:
+The [`examples/`](examples/) directory has complete working setups for 7 real APIs:
 
 | Example | API | Auth | Key Features |
 | --- | --- | --- | --- |
 | [nws](examples/nws/) | National Weather Service | None | GeoJSON, cursor pagination, path params, IMPORT FOREIGN SCHEMA |
 | [pokeapi](examples/pokeapi/) | PokéAPI | None | Offset-based pagination, auto-detected `results` wrapper |
 | [carapi](examples/carapi/) | CarAPI | None | Page-based pagination, query pushdown, `data` wrapper |
-| [github](examples/github/) | GitHub REST API | Bearer token | Custom headers, search pushdown, `items` wrapper |
+| [jsonplaceholder](examples/jsonplaceholder/) | JSONPlaceholder | None | INSERT/UPDATE/DELETE, body-level success checking, write debug output |
+| [httpbin](examples/httpbin/) | httpbin.org | None | Body envelopes, body/query rowid placement, per-op write endpoints |
+| [github](examples/github/) | GitHub REST API | Bearer token | Custom headers, search pushdown, `Link`-header pagination, session-variable auth, live writes |
 | [threads](examples/threads/) | Meta Threads API | OAuth (query param) | Cursor pagination, inline `spec_json` |
 
 Each includes a `README.md` walkthrough and an `init.sql` you can run directly.
@@ -96,7 +98,7 @@ bash test/run.sh
 # End-to-end benchmarks (Docker, vs pg_http)
 bash test/benchmark.sh
 
-# Example validation (Docker: runs all 5 examples)
+# Example validation (Docker: runs all 7 examples)
 bash test/run-examples.sh
 ```
 

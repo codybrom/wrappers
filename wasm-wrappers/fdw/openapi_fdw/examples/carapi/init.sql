@@ -2,7 +2,7 @@
 -- Free demo dataset (2015-2020 vehicles), no auth required.
 -- See: https://carapi.app/api
 -- Note: fdw_package_url uses file:// for local Docker testing. In production, use the
--- GitHub release URL: https://github.com/supabase/wrappers/releases/download/wasm_openapi_fdw_v0.2.0/openapi_fdw.wasm
+-- GitHub release URL: https://github.com/supabase/wrappers/releases/download/wasm_openapi_fdw_v0.3.0/openapi_fdw.wasm
 
 -- Create supabase_admin role if it doesn't exist (required by wrappers extension)
 DO $$
@@ -32,7 +32,7 @@ create server carapi
   options (
     fdw_package_url 'file:///openapi_fdw.wasm',
     fdw_package_name 'supabase:openapi-fdw',
-    fdw_package_version '0.2.0',
+    fdw_package_version '0.3.0',
     base_url 'https://carapi.app/api'
   );
 
@@ -44,7 +44,7 @@ create server carapi_debug
   options (
     fdw_package_url 'file:///openapi_fdw.wasm',
     fdw_package_name 'supabase:openapi-fdw',
-    fdw_package_version '0.2.0',
+    fdw_package_version '0.3.0',
     base_url 'https://carapi.app/api',
     debug 'true'
   );
@@ -57,7 +57,7 @@ create server carapi_import
   options (
     fdw_package_url 'file:///openapi_fdw.wasm',
     fdw_package_name 'supabase:openapi-fdw',
-    fdw_package_version '0.2.0',
+    fdw_package_version '0.3.0',
     base_url 'https://carapi.app/api',
     spec_url 'https://carapi.app/swagger.json'
   );
