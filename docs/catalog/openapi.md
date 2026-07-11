@@ -420,6 +420,8 @@ Some APIs return HTTP 2xx and signal per-record failure inside the response body
 
 When a writable table's options signal such an API — an explicit `success_status` containing codes beyond `200`/`201`/`204`, or a `body_root_path` envelope — `success_path` is required, and the statement errors before any HTTP request if it's missing. HTTP 207 Multi-Status responses are always rejected, since per-record outcomes inside them cannot be verified.
 
+An empty response body (for example `204 No Content`, common on DELETE) carries no failure signal, so the `success_path` body check is skipped for it and only the HTTP status is checked — a `success_path` configured for enveloped UPDATEs does not force DELETE responses to carry a body.
+
 !!! warning "Writes are not transactional"
 
     Writes cannot be rolled back. Each affected row issues an immediate HTTP request. An UPDATE over 500 rows that fails on row 300 leaves rows 1–299 permanently written on the remote API and aborts with a SQL error; `ROLLBACK` cannot undo HTTP calls, and `RETURNING` is unavailable to even report which rows succeeded. A `statement_timeout` firing mid-sequence leaves the same half-mutated state. Prefer small batches.
@@ -431,6 +433,7 @@ When a writable table's options signal such an API — an explicit `success_stat
 ### Write limitations
 
 - **No `RETURNING`** — rejected at statement planning. Server-assigned ids returned only in the response body are not visible to SQL; re-select to observe them.
+- **The rowid column cannot be changed** — `UPDATE ... SET <rowid_column> = ...` does not send the new value: the Wrappers framework strips the rowid column from the updated row before it reaches the FDW, and the request is still keyed and placed by the pre-update rowid. Change a record's identifier out of band, not through the foreign table.
 - **No batching** — a 100-row statement issues 100 requests, not one bulk call. Each request is a blocking round-trip, so large statements hold the connection; be mindful of `statement_timeout`.
 - **JSON bodies only** — form-encoded write bodies (`application/x-www-form-urlencoded`) are not supported.
 - **`IMPORT FOREIGN SCHEMA` stays read-only** — imported tables never carry write options; add `writable 'true'` and the per-op options manually.

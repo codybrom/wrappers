@@ -937,10 +937,23 @@ fn test_check_response_success_path_non_string_value() {
 
 #[test]
 fn test_check_response_unparseable_body_with_success_path_errors() {
+    // A non-empty body that is not JSON cannot be verified against
+    // success_path, so it fails (an empty body is handled separately below).
     let mut cfg = writable_config();
     cfg.success_path = Some("/code".to_string());
-    let err = check_response(200, "", &cfg, "/items", true).unwrap_err();
+    let err = check_response(200, "<html>502</html>", &cfg, "/items", true).unwrap_err();
     assert!(err.contains("not valid JSON"));
+}
+
+#[test]
+fn test_check_response_empty_body_with_success_path_ok() {
+    // An empty response body (e.g. 204 No Content on DELETE) carries no
+    // per-record failure signal, so a configured success_path does not fail
+    // the write — there is nothing in the body to verify.
+    let mut cfg = writable_config();
+    cfg.success_path = Some("/data/0/code".to_string());
+    assert!(check_response(200, "", &cfg, "/items", true).is_ok());
+    assert!(check_response(204, "   ", &cfg, "/items", true).is_ok());
 }
 
 #[test]

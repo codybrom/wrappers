@@ -505,7 +505,14 @@ pub(crate) fn check_response(
         ));
     }
 
-    if let Some(ref path) = cfg.success_path {
+    // A success_path check only applies when there is a body to inspect. An
+    // empty response (e.g. 204 No Content, common on DELETE) carries no
+    // per-record failure signal, so the status gate above is the only check
+    // that can apply — otherwise an empty-body DELETE on an envelope table
+    // (where success_path is mandatory) would always fail JSON parsing.
+    if let Some(ref path) = cfg.success_path
+        && !body.trim().is_empty()
+    {
         let parsed: JsonValue = serde_json::from_str(body).map_err(|_| {
             format!(
                 "write to API endpoint ({safe_endpoint}) returned HTTP {status_code} \
