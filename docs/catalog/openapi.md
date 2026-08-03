@@ -161,6 +161,9 @@ options (
 | `cursor_path` | No | JSON pointer to pagination cursor in response. |
 | `cursor_param` | No | Override server-level cursor parameter name. |
 | `has_more_path` | No | JSON pointer to the boolean saying another page exists (e.g. `/info/more_records`). Required with `page_param`. |
+| `error_path` | No | JSON pointer to an in-band error indicator in an otherwise successful (2xx) response, e.g. `/status`. Opt-in; disabled when unset. |
+| `error_value` | No | Value at `error_path` that means "error", e.g. `error`. When unset, any non-null, non-`false` value counts. |
+| `error_message_path` | No | JSON pointer to the API's own error message, surfaced in the raised error, e.g. `/message`. |
 | `page_param` | No | Override the server-level page parameter name. |
 | `page_size_param` | No | Override server-level page size parameter name. |
 | `page_size` | No | Override server-level page size. |
@@ -637,6 +640,37 @@ create foreign table openapi.users (
 server my_api_server
 options (endpoint '/users');
 ```
+
+### Errors reported inside a 2xx response
+
+Some APIs report failure in the response body rather than the status line --
+rate limiting and rejected requests both arrive that way. Without configuration
+such a response extracts to zero rows and reads as an empty result, which is
+wrong data presented as success. `error_path` makes it an error instead:
+
+```sql
+create foreign table zoho.records (
+  id text,
+  attrs jsonb
+)
+server zoho_api
+options (
+  endpoint '/crm/v2/Deals',
+  response_path '/data',
+  error_path '/status',
+  error_value 'error',
+  error_message_path '/message'
+);
+```
+
+A response of `{"code": "RATE_LIMIT_EXCEEDED", "message": "API rate limit
+exceeded.", "status": "error"}` then raises with the API's own message rather
+than returning nothing.
+
+!!! note "Empty responses"
+    A successful response with an empty body is treated as zero rows, not a
+    parse error. Several APIs answer `204` (or a body-less `200`) instead of an
+    empty collection when a lookup matches nothing.
 
 ## Limitations
 

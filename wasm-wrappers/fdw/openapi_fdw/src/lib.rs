@@ -60,6 +60,14 @@ struct OpenApiFdw {
     /// JSON pointer to the boolean saying another page exists. Required by, and
     /// only meaningful with, page-number pagination (`page_param`).
     has_more_path: String,
+    /// JSON pointer to an in-band error indicator in an otherwise successful
+    /// response. Empty disables the check; it is opt-in and never inferred.
+    error_path: String,
+    /// Value at `error_path` that means "error". Empty means any non-null,
+    /// non-false value counts.
+    error_value: String,
+    /// JSON pointer to the API's own error message, surfaced in the raised error.
+    error_message_path: Option<String>,
 
     // Pagination state and loop detection
     pagination: PaginationState,
@@ -104,6 +112,9 @@ impl Default for OpenApiFdw {
             rowid_col: String::new(),
             cursor_path: String::new(),
             has_more_path: String::new(),
+            error_path: String::new(),
+            error_value: String::new(),
+            error_message_path: None,
             pagination: PaginationState::default(),
             write: None,
             injected_params: HashMap::new(),
@@ -439,6 +450,9 @@ impl Guest for OpenApiFdw {
         this.object_path = opts.get("object_path"); // e.g., "/properties" for GeoJSON
         this.cursor_path = opts.require_or("cursor_path", "");
         this.has_more_path = opts.require_or("has_more_path", "");
+        this.error_path = opts.require_or("error_path", "");
+        this.error_value = opts.require_or("error_value", "");
+        this.error_message_path = opts.get("error_message_path");
 
         // Restore server-level pagination defaults before applying table overrides
         this.config.restore_pagination_defaults();

@@ -98,6 +98,50 @@ pub(crate) fn method_is_idempotent(method: http::Method) -> bool {
 }
 
 impl OpenApiFdw {
+    /// Raise if a successful (2xx) response body reports an error in band.
+    ///
+    /// Opt-in via `error_path`; the shape is API-specific so nothing is
+    /// inferred. When `error_value` is set the value at `error_path` must equal
+    /// it to count as an error, otherwise any non-null, non-`false` value does.
+    /// The message comes from `error_message_path` when configured, so the
+    /// API's own wording reaches the user instead of a generic failure.
+    ///
+    /// This exists because a 2xx that means "rate limited" or "request
+    /// rejected" would otherwise extract to zero rows and read as an empty
+    /// result -- wrong data presented as success, which is worse than an error.
+    pub(crate) fn check_response_error(&self, resp: &JsonValue) -> Result<(), FdwError> {
+        if self.error_path.is_empty() {
+            return Ok(());
+        }
+        let Some(found) = resp.pointer(&self.error_path) else {
+            return Ok(());
+        };
+
+        let is_error = if self.error_value.is_empty() {
+            !matches!(found, JsonValue::Null | JsonValue::Bool(false))
+        } else {
+            found.as_str() == Some(self.error_value.as_str())
+        };
+        if !is_error {
+            return Ok(());
+        }
+
+        let detail = self
+            .error_message_path
+            .as_deref()
+            .and_then(|p| resp.pointer(p))
+            .and_then(|v| v.as_str().map(ToOwned::to_owned))
+            .unwrap_or_else(|| match found.as_str() {
+                Some(s) => s.to_owned(),
+                None => found.to_string(),
+            });
+
+        Err(format!(
+            "API reported an error at {} in an otherwise successful response: {detail}",
+            self.error_path
+        ))
+    }
+
     /// Fetch and parse the OpenAPI spec
     pub(crate) fn fetch_spec(&mut self) -> Result<(), FdwError> {
         if let Some(ref url) = self.config.spec_url {
@@ -651,8 +695,28 @@ impl OpenApiFdw {
             ));
         }
 
+        // An empty body on a successful response means "no records", not a
+        // parse failure. Several APIs answer 204 (or a body-less 200) rather
+        // than an empty collection -- Zoho does it for a lookup that matches
+        // nothing -- and parsing "" as JSON fails with a bare "EOF while
+        // parsing a value" that says nothing useful to the user.
+        if resp.body.trim().is_empty() {
+            self.src_rows = Vec::new();
+            self.src_idx = 0;
+            self.pagination.clear_next();
+            self.build_column_key_map();
+            stats::inc_stats(FDW_NAME, stats::Metric::BytesIn, resp.body.len() as i64);
+            return Ok(());
+        }
+
         let mut resp_json: JsonValue =
             serde_json::from_str(&resp.body).map_err(|e| e.to_string())?;
+
+        // Some APIs report failure inside a 2xx body rather than in the status
+        // line -- rate limiting and per-request errors both arrive that way --
+        // so a status check alone would read them as "no data" and silently
+        // return an empty result. Opt-in, because the shape is API-specific.
+        self.check_response_error(&resp_json)?;
 
         stats::inc_stats(FDW_NAME, stats::Metric::BytesIn, resp.body.len() as i64);
 

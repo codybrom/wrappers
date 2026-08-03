@@ -794,3 +794,77 @@ fn test_method_is_idempotent() {
     assert!(!method_is_idempotent(http::Method::Post));
     assert!(!method_is_idempotent(http::Method::Patch));
 }
+
+// --- in-band error detection (check_response_error) ---
+
+fn fdw_with_error_opts(path: &str, value: &str, msg_path: Option<&str>) -> OpenApiFdw {
+    OpenApiFdw {
+        error_path: path.to_string(),
+        error_value: value.to_string(),
+        error_message_path: msg_path.map(ToOwned::to_owned),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn test_error_check_disabled_by_default() {
+    let fdw = OpenApiFdw::default();
+    let resp = serde_json::json!({"status": "error", "message": "nope"});
+    assert!(fdw.check_response_error(&resp).is_ok());
+}
+
+#[test]
+fn test_error_check_matches_configured_value() {
+    // Zoho's shape: a 2xx carrying {code, message, status: "error"}.
+    let fdw = fdw_with_error_opts("/status", "error", Some("/message"));
+    let resp = serde_json::json!({
+        "code": "RATE_LIMIT_EXCEEDED",
+        "message": "API rate limit exceeded.",
+        "status": "error"
+    });
+    let err = fdw.check_response_error(&resp).unwrap_err();
+    assert!(err.contains("API rate limit exceeded."), "got: {err}");
+}
+
+#[test]
+fn test_error_check_ignores_non_matching_value() {
+    let fdw = fdw_with_error_opts("/status", "error", Some("/message"));
+    let resp = serde_json::json!({"status": "success", "data": []});
+    assert!(fdw.check_response_error(&resp).is_ok());
+}
+
+#[test]
+fn test_error_check_absent_path_is_ok() {
+    let fdw = fdw_with_error_opts("/status", "error", None);
+    let resp = serde_json::json!({"data": [{"id": 1}]});
+    assert!(fdw.check_response_error(&resp).is_ok());
+}
+
+#[test]
+fn test_error_check_without_value_treats_any_truthy_as_error() {
+    let fdw = fdw_with_error_opts("/errors", "", None);
+    assert!(
+        fdw.check_response_error(&serde_json::json!({"errors": ["boom"]}))
+            .is_err()
+    );
+    // null and false are not errors
+    assert!(
+        fdw.check_response_error(&serde_json::json!({"errors": null}))
+            .is_ok()
+    );
+    assert!(
+        fdw.check_response_error(&serde_json::json!({"errors": false}))
+            .is_ok()
+    );
+}
+
+#[test]
+fn test_error_check_falls_back_to_the_flag_value_as_detail() {
+    // No error_message_path configured: the raised error still carries
+    // something identifiable rather than a bare "error".
+    let fdw = fdw_with_error_opts("/code", "", None);
+    let err = fdw
+        .check_response_error(&serde_json::json!({"code": "TOO_MANY_REQUESTS"}))
+        .unwrap_err();
+    assert!(err.contains("TOO_MANY_REQUESTS"), "got: {err}");
+}
