@@ -26,6 +26,9 @@ pub(crate) struct ServerConfig {
     pub(crate) page_size: usize,
     pub(crate) page_size_param: String,
     pub(crate) cursor_param: String,
+    /// Query parameter incremented for page-number pagination. Empty disables
+    /// page mode entirely; it is opt-in and never inferred.
+    pub(crate) page_param: String,
     pub(crate) max_pages: usize,
     pub(crate) max_response_bytes: usize,
     pub(crate) debug: bool,
@@ -38,6 +41,7 @@ pub(crate) struct ServerConfig {
     pub(crate) default_page_size: usize,
     pub(crate) default_page_size_param: String,
     pub(crate) default_cursor_param: String,
+    pub(crate) default_page_param: String,
 }
 
 /// Manual Debug impl to redact authentication secrets (headers may contain
@@ -66,6 +70,7 @@ impl std::fmt::Debug for ServerConfig {
             .field("page_size", &self.page_size)
             .field("page_size_param", &self.page_size_param)
             .field("cursor_param", &self.cursor_param)
+            .field("page_param", &self.page_param)
             .field("max_pages", &self.max_pages)
             .field("max_response_bytes", &self.max_response_bytes)
             .field("debug", &self.debug)
@@ -86,6 +91,7 @@ impl Default for ServerConfig {
             page_size: 0,
             page_size_param: String::new(),
             cursor_param: String::new(),
+            page_param: String::new(),
             max_pages: DEFAULT_MAX_PAGES,
             max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
             debug: false,
@@ -94,6 +100,7 @@ impl Default for ServerConfig {
             default_page_size: 0,
             default_page_size_param: String::new(),
             default_cursor_param: String::new(),
+            default_page_param: String::new(),
         }
     }
 }
@@ -131,6 +138,7 @@ impl ServerConfig {
         self.default_page_size_param
             .clone_from(&self.page_size_param);
         self.default_cursor_param.clone_from(&self.cursor_param);
+        self.default_page_param.clone_from(&self.page_param);
     }
 
     /// Restore pagination fields to server-level defaults.
@@ -141,6 +149,7 @@ impl ServerConfig {
         self.page_size_param
             .clone_from(&self.default_page_size_param);
         self.cursor_param.clone_from(&self.default_cursor_param);
+        self.page_param.clone_from(&self.default_page_param);
     }
 
     /// Configure request headers from server options

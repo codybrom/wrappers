@@ -1101,3 +1101,101 @@ fn test_link_header_empty_or_malformed() {
     fdw.handle_pagination(&resp, &headers);
     assert!(fdw.pagination.next.is_none());
 }
+
+// --- page-number pagination tests ---
+
+/// An FDW configured for page-number pagination (page_param + has_more_path).
+fn make_fdw_for_pages(has_more_path: &str) -> OpenApiFdw {
+    OpenApiFdw {
+        has_more_path: has_more_path.to_string(),
+        config: ServerConfig {
+            page_param: "page".to_string(),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+#[test]
+fn test_page_pagination_first_page_more_records_true() {
+    // No previous token means this was the first page, which is requested
+    // without a page param -- so the next page is 2, not 1.
+    let mut fdw = make_fdw_for_pages("/info/more_records");
+    let resp = serde_json::json!({"data": [{"id": 1}], "info": {"more_records": true}});
+    fdw.handle_pagination(&resp, &[]);
+    assert_eq!(fdw.pagination.next, Some(PaginationToken::Page(2)));
+}
+
+#[test]
+fn test_page_pagination_increments_from_previous() {
+    let mut fdw = make_fdw_for_pages("/info/more_records");
+    fdw.pagination.previous = Some(PaginationToken::Page(3));
+    let resp = serde_json::json!({"data": [{"id": 1}], "info": {"more_records": true}});
+    fdw.handle_pagination(&resp, &[]);
+    assert_eq!(fdw.pagination.next, Some(PaginationToken::Page(4)));
+}
+
+#[test]
+fn test_page_pagination_stops_when_more_records_false() {
+    let mut fdw = make_fdw_for_pages("/info/more_records");
+    fdw.pagination.previous = Some(PaginationToken::Page(3));
+    let resp = serde_json::json!({"data": [{"id": 1}], "info": {"more_records": false}});
+    fdw.handle_pagination(&resp, &[]);
+    assert_eq!(fdw.pagination.next, None);
+}
+
+#[test]
+fn test_page_pagination_stops_when_flag_missing() {
+    // A pointer that resolves to nothing ends the scan rather than looping.
+    let mut fdw = make_fdw_for_pages("/info/more_records");
+    let resp = serde_json::json!({"data": [{"id": 1}]});
+    fdw.handle_pagination(&resp, &[]);
+    assert_eq!(fdw.pagination.next, None);
+}
+
+#[test]
+fn test_page_pagination_accepts_quoted_boolean() {
+    // Some APIs quote the flag; "true" must not read as "not a bool" and stop
+    // the scan after one page.
+    let mut fdw = make_fdw_for_pages("/info/more_records");
+    let resp = serde_json::json!({"data": [], "info": {"more_records": "true"}});
+    fdw.handle_pagination(&resp, &[]);
+    assert_eq!(fdw.pagination.next, Some(PaginationToken::Page(2)));
+}
+
+#[test]
+fn test_page_pagination_is_exclusive_of_other_mechanisms() {
+    // Once page mode is configured, a next-URL field in the body must not
+    // hijack paging onto URL mode.
+    let mut fdw = make_fdw_for_pages("/info/more_records");
+    let resp = serde_json::json!({
+        "data": [],
+        "next": "https://api.example.com/items?page=99",
+        "info": {"more_records": true}
+    });
+    fdw.handle_pagination(&resp, &[]);
+    assert_eq!(fdw.pagination.next, Some(PaginationToken::Page(2)));
+}
+
+#[test]
+fn test_page_pagination_ignores_link_header() {
+    let mut fdw = make_fdw_for_pages("/info/more_records");
+    let resp = serde_json::json!({"data": [], "info": {"more_records": false}});
+    let headers = vec![(
+        "link".to_string(),
+        "<https://api.example.com/items?page=2>; rel=\"next\"".to_string(),
+    )];
+    fdw.handle_pagination(&resp, &headers);
+    assert_eq!(fdw.pagination.next, None);
+}
+
+#[test]
+fn test_extract_bool_forms() {
+    let resp = serde_json::json!({"a": true, "b": false, "c": "true", "d": "yes", "e": 1});
+    assert_eq!(OpenApiFdw::extract_bool(&resp, "/a"), Some(true));
+    assert_eq!(OpenApiFdw::extract_bool(&resp, "/b"), Some(false));
+    assert_eq!(OpenApiFdw::extract_bool(&resp, "/c"), Some(true));
+    assert_eq!(OpenApiFdw::extract_bool(&resp, "/d"), None);
+    assert_eq!(OpenApiFdw::extract_bool(&resp, "/e"), None);
+    assert_eq!(OpenApiFdw::extract_bool(&resp, "/missing"), None);
+}

@@ -573,3 +573,37 @@ fn test_whitespace_cursors_are_distinct() {
     };
     assert!(state.detect_loop().is_none());
 }
+
+// --- page-number token tests ---
+
+#[test]
+fn test_page_token_accessors() {
+    let page = PaginationToken::Page(7);
+    assert_eq!(page.as_page(), Some(7));
+    assert_eq!(page.as_cursor(), None);
+    assert_eq!(page.as_url(), None);
+
+    // The other kinds must not report a page number.
+    assert_eq!(PaginationToken::Cursor("x".to_string()).as_page(), None);
+    assert_eq!(PaginationToken::Url("u".to_string()).as_page(), None);
+}
+
+#[test]
+fn test_detect_loop_duplicate_page() {
+    let state = PaginationState {
+        next: Some(PaginationToken::Page(4)),
+        previous: Some(PaginationToken::Page(4)),
+        pages_fetched: 4,
+    };
+    assert!(state.detect_loop().is_some());
+}
+
+#[test]
+fn test_detect_loop_advancing_pages_is_not_a_loop() {
+    let state = PaginationState {
+        next: Some(PaginationToken::Page(5)),
+        previous: Some(PaginationToken::Page(4)),
+        pages_fetched: 4,
+    };
+    assert!(state.detect_loop().is_none());
+}

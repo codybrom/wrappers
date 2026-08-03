@@ -324,3 +324,41 @@ fn test_extract_effective_row_nested_path() {
     let result = extract_effective_row(&row, Some("/a/b"));
     assert_eq!(result, &serde_json::json!({"c": 42}));
 }
+
+// --- page-number pagination option validation ---
+
+#[test]
+fn test_validate_pagination_options_accepts_neither() {
+    assert!(validate_pagination_options("", "", "").is_ok());
+}
+
+#[test]
+fn test_validate_pagination_options_accepts_both() {
+    assert!(validate_pagination_options("page", "/info/more_records", "").is_ok());
+}
+
+#[test]
+fn test_validate_pagination_options_accepts_cursor_alone() {
+    assert!(validate_pagination_options("", "", "/meta/next_cursor").is_ok());
+}
+
+#[test]
+fn test_validate_pagination_options_rejects_page_param_without_has_more_path() {
+    let err = validate_pagination_options("page", "", "").unwrap_err();
+    assert!(err.contains("has_more_path"), "unexpected message: {err}");
+}
+
+#[test]
+fn test_validate_pagination_options_rejects_has_more_path_without_page_param() {
+    let err = validate_pagination_options("", "/info/more_records", "").unwrap_err();
+    assert!(err.contains("page_param"), "unexpected message: {err}");
+}
+
+#[test]
+fn test_validate_pagination_options_rejects_page_and_cursor_together() {
+    let err = validate_pagination_options("page", "/info/more_records", "/next").unwrap_err();
+    assert!(
+        err.contains("cannot both be set"),
+        "unexpected message: {err}"
+    );
+}

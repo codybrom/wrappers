@@ -385,6 +385,15 @@ impl OpenApiFdw {
             ));
         }
 
+        // Add the page number for page-number pagination. Absent on the first
+        // request of a scan, so the API's own default first page applies.
+        if let Some(page) = self.pagination.next.as_ref().and_then(|t| t.as_page()) {
+            params.push(format!(
+                "{}={page}",
+                urlencoding::encode(&self.config.page_param)
+            ));
+        }
+
         // Add page size if configured, reduced by LIMIT when available.
         // `src_limit` is only Some when the LIMIT can be honored remotely (no
         // locally-filtered quals — see begin_scan), so capping here is safe.

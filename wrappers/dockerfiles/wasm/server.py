@@ -728,6 +728,29 @@ class MockServer(BaseHTTPRequestHandler):
             # unwrapped to 'items' -- doing so would discard 'total'.
             elif req_path == "/biz_siblings" or req_path.startswith("/biz_siblings?"):
                 body = json.dumps({"items": {"sku": "A1", "qty": 2}, "total": 99.99})
+            # Page-number pagination: no next URL and no cursor anywhere in the
+            # response, only a boolean saying more remains. 5 records over 3
+            # pages of 2, so a scan that ignores the flag returns 2 of 5.
+            elif req_path == "/paged" or req_path.startswith("/paged?"):
+                qs = parse_qs(urlparse(req_path).query)
+                try:
+                    page = int(qs.get("page", ["1"])[0])
+                except ValueError:
+                    page = 1
+                per_page = 2
+                records = [{"id": i, "name": "item-%d" % i} for i in range(1, 6)]
+                start = (page - 1) * per_page
+                chunk = records[start : start + per_page]
+                body = json.dumps(
+                    {
+                        "data": chunk,
+                        "info": {
+                            "page": page,
+                            "count": len(chunk),
+                            "more_records": start + per_page < len(records),
+                        },
+                    }
+                )
             # Scan source for the rowid-reassignment UPDATE test.
             elif req_path == "/wr_reassign" or req_path.startswith("/wr_reassign?"):
                 body = json.dumps([{"id": "r-1", "name": "old"}])

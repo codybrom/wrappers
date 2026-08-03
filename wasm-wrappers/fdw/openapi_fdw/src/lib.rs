@@ -57,6 +57,9 @@ struct OpenApiFdw {
     object_path: Option<String>, // Extract nested object from each row (e.g., "/properties" for GeoJSON)
     rowid_col: String,
     cursor_path: String,
+    /// JSON pointer to the boolean saying another page exists. Required by, and
+    /// only meaningful with, page-number pagination (`page_param`).
+    has_more_path: String,
 
     // Pagination state and loop detection
     pagination: PaginationState,
@@ -100,6 +103,7 @@ impl Default for OpenApiFdw {
             object_path: None,
             rowid_col: String::new(),
             cursor_path: String::new(),
+            has_more_path: String::new(),
             pagination: PaginationState::default(),
             write: None,
             injected_params: HashMap::new(),
@@ -229,6 +233,46 @@ pub(crate) fn reject_rowid_reassignment(
     Ok(())
 }
 
+/// Validate the page-number pagination options.
+///
+/// `page_param` and `has_more_path` are two halves of one opt-in mechanism, so
+/// either alone is a misconfiguration rather than a partial feature: with only
+/// `page_param` there is no signal to stop on, and with only `has_more_path`
+/// there is nothing to increment. Either would otherwise degrade silently into
+/// a single-page read — the exact failure this feature exists to prevent.
+///
+/// `cursor_path` alongside `page_param` is also rejected: two next-page
+/// mechanisms configured at once has no unambiguous meaning.
+pub(crate) fn validate_pagination_options(
+    page_param: &str,
+    has_more_path: &str,
+    cursor_path: &str,
+) -> Result<(), String> {
+    if !page_param.is_empty() && has_more_path.is_empty() {
+        return Err(
+            "page_param is set but has_more_path is not: page-number pagination needs a \
+             JSON pointer to the boolean that says another page exists \
+             (e.g. has_more_path '/info/more_records')."
+                .to_string(),
+        );
+    }
+    if page_param.is_empty() && !has_more_path.is_empty() {
+        return Err(
+            "has_more_path is set but page_param is not: page-number pagination needs the \
+             query parameter to increment (e.g. page_param 'page')."
+                .to_string(),
+        );
+    }
+    if !page_param.is_empty() && !cursor_path.is_empty() {
+        return Err(
+            "cursor_path and page_param cannot both be set: choose cursor pagination or \
+             page-number pagination, not both."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// Check whether the consumed row count has reached or exceeded the limit.
 fn should_stop_scanning(consumed: i64, limit: Option<i64>) -> bool {
     limit.is_some_and(|l| consumed >= l)
@@ -345,6 +389,8 @@ impl Guest for OpenApiFdw {
 
         this.config.page_size_param = opts.require_or("page_size_param", DEFAULT_PAGE_SIZE_PARAM);
         this.config.cursor_param = opts.require_or("cursor_param", DEFAULT_CURSOR_PARAM);
+        // No default: an empty page_param means page-number pagination is off.
+        this.config.page_param = opts.require_or("page_param", "");
 
         // Maximum pages per scan (default 1000, prevents infinite pagination loops)
         if let Some(s) = opts.get("max_pages") {
@@ -392,6 +438,7 @@ impl Guest for OpenApiFdw {
         this.response_path = opts.get("response_path");
         this.object_path = opts.get("object_path"); // e.g., "/properties" for GeoJSON
         this.cursor_path = opts.require_or("cursor_path", "");
+        this.has_more_path = opts.require_or("has_more_path", "");
 
         // Restore server-level pagination defaults before applying table overrides
         this.config.restore_pagination_defaults();
@@ -400,6 +447,18 @@ impl Guest for OpenApiFdw {
         if let Some(param) = opts.get("cursor_param") {
             this.config.cursor_param = param;
         }
+        if let Some(param) = opts.get("page_param") {
+            this.config.page_param = param;
+        }
+        // Page mode is opt-in and must be fully specified. Catching a half
+        // configuration here turns a typo into a startup error instead of a
+        // silent single-page read, and rejects the ambiguous case where two
+        // pagination mechanisms are configured at once.
+        validate_pagination_options(
+            &this.config.page_param,
+            &this.has_more_path,
+            &this.cursor_path,
+        )?;
         if let Some(param) = opts.get("page_size_param") {
             this.config.page_size_param = param;
         }

@@ -116,6 +116,7 @@ We need to provide Postgres with the credentials to access the API and any addit
 | `page_size` | No | Default page size for pagination (0 = no automatic limit). |
 | `page_size_param` | No | Query parameter name for page size (default: `limit`). |
 | `cursor_param` | No | Query parameter name for pagination cursor (default: `after`). |
+| `page_param` | No | Query parameter to increment for page-number pagination (e.g. `page`). Opt-in; requires `has_more_path` on the table. |
 | `max_pages` | No | Maximum pages per scan to prevent infinite pagination loops (default: `1000`). |
 | `max_response_bytes` | No | Maximum response body size in bytes (default: `52428800` / 50 MiB). |
 | `debug` | No | Emit HTTP request details and scan stats via PostgreSQL INFO messages when set to `'true'` or `'1'`. |
@@ -159,6 +160,8 @@ options (
 | `object_path` | No | JSON pointer to extract nested object from each row (e.g., `/properties` for GeoJSON). |
 | `cursor_path` | No | JSON pointer to pagination cursor in response. |
 | `cursor_param` | No | Override server-level cursor parameter name. |
+| `has_more_path` | No | JSON pointer to the boolean saying another page exists (e.g. `/info/more_records`). Required with `page_param`. |
+| `page_param` | No | Override the server-level page parameter name. |
 | `page_size_param` | No | Override server-level page size parameter name. |
 | `page_size` | No | Override server-level page size. |
 | `method` | No | HTTP method for this endpoint. Use `POST` for read-via-POST endpoints (default: `GET`). |
@@ -497,9 +500,10 @@ Debug output includes:
 The FDW automatically handles pagination. It supports:
 
 1. **Cursor-based pagination** - Uses `cursor_param` and `cursor_path`
-2. **URL-based pagination** - Follows `next` links in response body (e.g., `/links/next`, `/meta/pagination/next`)
-3. **`Link` header pagination** - Follows [RFC 8288](https://datatracker.ietf.org/doc/html/rfc8288) `Link: <...>; rel="next"` response headers (GitHub, GitLab, and most REST APIs)
-4. **Offset-based pagination** - Auto-detected from common patterns
+2. **Page-number pagination** - Uses `page_param` and `has_more_path`, for APIs that send neither a cursor nor a next URL
+3. **URL-based pagination** - Follows `next` links in response body (e.g., `/links/next`, `/meta/pagination/next`)
+4. **`Link` header pagination** - Follows [RFC 8288](https://datatracker.ietf.org/doc/html/rfc8288) `Link: <...>; rel="next"` response headers (GitHub, GitLab, and most REST APIs)
+5. **Offset-based pagination** - Auto-detected from common patterns
 
 ### Configuring Pagination
 
@@ -530,6 +534,56 @@ options (
   cursor_path '/meta/next_cursor'
 );
 ```
+
+#### Page-number pagination
+
+Some APIs send neither a cursor nor a next URL: you advance by incrementing a
+page number, and a boolean elsewhere in the response tells you whether to keep
+going. Zoho is the common example, with `info.more_records`.
+
+```sql
+create server zoho_api
+  foreign data wrapper wasm_wrapper
+  options (
+    fdw_package_url 'https://github.com/supabase/wrappers/releases/download/wasm_openapi_fdw_v0.2.1/openapi_fdw.wasm',
+    fdw_package_name 'supabase:openapi-fdw',
+    fdw_package_version '0.2.1',
+    fdw_package_checksum '12c902f3089e18142a1d8d35c66b9ceb85c193224229687bd929aff6b44cddde',
+    base_url 'https://www.zohoapis.com',
+    page_param 'page',
+    page_size_param 'per_page',
+    page_size '200'
+  );
+
+create foreign table zoho.records (
+  id text,
+  name text,
+  attrs jsonb
+)
+server zoho_api
+options (
+  endpoint '/crm/v2/Deals',
+  response_path '/data',
+  has_more_path '/info/more_records'
+);
+```
+
+The first request carries no page parameter, so the API's own default first
+page applies; subsequent requests send `page=2`, `page=3`, and so on.
+
+!!! warning
+    `page_param` and `has_more_path` are two halves of one mechanism and must be
+    set together — either alone is rejected at scan start. Without a stop signal
+    the scan would silently return only the first page, which is the failure
+    this option exists to prevent. `page_param` also cannot be combined with
+    `cursor_path`.
+
+    Page mode is exclusive: once `page_param` is set, `Link` headers and
+    next-URL/cursor auto-detection are not consulted, so a stray `next` field in
+    a response cannot redirect paging.
+
+    Scanning still stops on any of: the flag reading false, a page returning no
+    rows, a satisfied `LIMIT`, or the `max_pages` server option (default 1000).
 
 ## GeoJSON Support
 

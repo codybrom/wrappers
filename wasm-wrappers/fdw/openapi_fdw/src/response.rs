@@ -175,12 +175,35 @@ impl OpenApiFdw {
     /// Handle pagination from the response.
     ///
     /// Precedence (first match wins):
+    ///   0. Page-number pagination, when `page_param` + `has_more_path` are set
+    ///      — exclusive: no other mechanism is consulted
     ///   1. Explicit `cursor_path` configured by the user
     ///   2. RFC 8288 `Link` header with `rel="next"` (GitHub, GitLab, etc.)
     ///   3. JSON-body auto-detection: known next-URL paths
     ///   4. JSON-body auto-detection: `has_more` flag + cursor paths
     pub(crate) fn handle_pagination(&mut self, resp: &JsonValue, headers: &[(String, String)]) {
         self.pagination.clear_next();
+
+        // 0. Page-number pagination. Deliberately exclusive rather than just
+        //    first: once the user has opted in by configuring page_param, a
+        //    stray `/next` or `has_more` field in the response must not be able
+        //    to hijack paging onto a different mechanism.
+        //
+        //    An empty data page also ends the scan, but that backstop lives in
+        //    iter_scan, which is the only place that knows the row count.
+        if !self.config.page_param.is_empty() {
+            if Self::extract_bool(resp, &self.has_more_path) == Some(true) {
+                // The token used for *this* request was moved to `previous` by
+                // advance(); its absence means this was the first page, which
+                // is sent without a page param, so the next page is 2.
+                let next_page = match self.pagination.previous.as_ref().and_then(|t| t.as_page()) {
+                    Some(current) => current.saturating_add(1),
+                    None => 2,
+                };
+                self.pagination.next = Some(PaginationToken::Page(next_page));
+            }
+            return;
+        }
 
         // 1. Try configured cursor path first (explicit user config wins)
         if !self.cursor_path.is_empty() {
@@ -240,6 +263,22 @@ impl OpenApiFdw {
             .and_then(JsonValue::as_str)
             .filter(|s| !s.is_empty())
             .map(ToString::to_string)
+    }
+
+    /// Extract a boolean from a JSON pointer path.
+    ///
+    /// Accepts the JSON string forms `"true"`/`"false"` as well as a real
+    /// boolean: some APIs quote the flag, and a quoted `"true"` read as "not a
+    /// bool" would silently stop after one page. Anything else is None, which
+    /// callers treat as "no more pages" — the safe direction, since it ends the
+    /// scan rather than looping.
+    pub(crate) fn extract_bool(json: &JsonValue, path: &str) -> Option<bool> {
+        let value = json.pointer(path)?;
+        value.as_bool().or_else(|| match value.as_str()? {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        })
     }
 }
 

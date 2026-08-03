@@ -1621,4 +1621,175 @@ mod tests {
             );
         });
     }
+
+    // Create the wasm FDW handler and a server configured for page-number
+    // pagination against the mock's /paged endpoint.
+    fn create_openapi_paged_server(c: &mut pgrx::spi::SpiClient<'_>, page_param: &str) {
+        c.update(
+            r#"CREATE FOREIGN DATA WRAPPER wasm_wrapper
+                 HANDLER wasm_fdw_handler VALIDATOR wasm_fdw_validator"#,
+            None,
+            &[],
+        )
+        .unwrap();
+
+        c.update(
+            &format!(
+                r#"CREATE SERVER openapi_paged_server
+                     FOREIGN DATA WRAPPER wasm_wrapper
+                     OPTIONS (
+                       fdw_package_url 'file://../../../wasm-wrappers/fdw/target/wasm32-unknown-unknown/release/openapi_fdw.wasm',
+                       fdw_package_name 'supabase:openapi-fdw',
+                       fdw_package_version '>=0.1.0',
+                       base_url 'http://localhost:8096/openapi',
+                       page_param '{page_param}',
+                       page_size_param 'per_page',
+                       page_size '2'
+                     )"#
+            ),
+            None,
+            &[],
+        )
+        .unwrap();
+    }
+
+    // The mock's /paged endpoint returns 5 records over 3 pages of 2 and
+    // signals continuation only with info.more_records -- no next URL, no
+    // cursor. Before page-number support a scan returned 2 of 5 and reported
+    // success, so the row count is the whole point of this test.
+    #[pg_test]
+    fn openapi_page_number_pagination_fetches_every_page() {
+        Spi::connect_mut(|c| {
+            create_openapi_paged_server(c, "page");
+            c.update(
+                r#"
+                  CREATE FOREIGN TABLE paged_items (
+                    id bigint,
+                    name text
+                  )
+                  SERVER openapi_paged_server
+                  OPTIONS (
+                    endpoint '/paged',
+                    response_path '/data',
+                    has_more_path '/info/more_records'
+                  )
+             "#,
+                None,
+                &[],
+            )
+            .unwrap();
+
+            let names = c
+                .select("SELECT name FROM paged_items ORDER BY id", None, &[])
+                .unwrap()
+                .filter_map(|r| r.get_by_name::<&str, _>("name").unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                names,
+                vec!["item-1", "item-2", "item-3", "item-4", "item-5"],
+                "expected all 5 records across 3 pages"
+            );
+        });
+    }
+
+    // LIMIT still stops the scan early rather than walking every page.
+    #[pg_test]
+    fn openapi_page_number_pagination_respects_limit() {
+        Spi::connect_mut(|c| {
+            create_openapi_paged_server(c, "page");
+            c.update(
+                r#"
+                  CREATE FOREIGN TABLE paged_limited (
+                    id bigint,
+                    name text
+                  )
+                  SERVER openapi_paged_server
+                  OPTIONS (
+                    endpoint '/paged',
+                    response_path '/data',
+                    has_more_path '/info/more_records'
+                  )
+             "#,
+                None,
+                &[],
+            )
+            .unwrap();
+
+            let n = c
+                .select("SELECT count(*) AS n FROM (SELECT * FROM paged_limited LIMIT 3) t", None, &[])
+                .unwrap()
+                .filter_map(|r| r.get_by_name::<i64, _>("n").unwrap())
+                .next()
+                .unwrap();
+            assert_eq!(n, 3);
+        });
+    }
+
+    // page_param without has_more_path is a half configuration: there would be
+    // no signal to stop on, so it must error at scan start rather than degrade
+    // into the single-page read this feature exists to prevent.
+    #[pg_test]
+    fn openapi_page_param_without_has_more_path_rejected() {
+        Spi::connect_mut(|c| {
+            create_openapi_paged_server(c, "page");
+            c.update(
+                r#"
+                  CREATE FOREIGN TABLE paged_misconfigured (
+                    id bigint,
+                    name text
+                  )
+                  SERVER openapi_paged_server
+                  OPTIONS (
+                    endpoint '/paged',
+                    response_path '/data'
+                  )
+             "#,
+                None,
+                &[],
+            )
+            .unwrap();
+        });
+
+        let result = std::panic::catch_unwind(|| {
+            Spi::connect_mut(|c| {
+                c.select("SELECT * FROM paged_misconfigured", None, &[])
+                    .is_err()
+            })
+        });
+        assert!(result.is_err());
+    }
+
+    // Existing cursor/URL/Link-header tables must be untouched by the new
+    // options: with no page_param configured, nothing changes.
+    #[pg_test]
+    fn openapi_page_pagination_is_opt_in_only() {
+        Spi::connect_mut(|c| {
+            create_openapi_paged_server(c, "");
+            c.update(
+                r#"
+                  CREATE FOREIGN TABLE paged_optout (
+                    id bigint,
+                    name text
+                  )
+                  SERVER openapi_paged_server
+                  OPTIONS (
+                    endpoint '/paged',
+                    response_path '/data'
+                  )
+             "#,
+                None,
+                &[],
+            )
+            .unwrap();
+
+            // No page_param, so no page mode and no error: the scan reads the
+            // first page only, exactly as it did before this feature.
+            let names = c
+                .select("SELECT name FROM paged_optout ORDER BY id", None, &[])
+                .unwrap()
+                .filter_map(|r| r.get_by_name::<&str, _>("name").unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(names, vec!["item-1", "item-2"]);
+        });
+    }
 }
