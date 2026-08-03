@@ -291,6 +291,54 @@ fn test_generate_all_tables_no_filter() {
 }
 
 #[test]
+fn test_generate_all_tables_skips_post() {
+    // A GET and a POST on the same path: only the GET table is auto-imported, so
+    // a plain SELECT can never trigger a POST side effect.
+    let spec = OpenApiSpec::from_str(
+        r#"{
+        "openapi": "3.0.0",
+        "info": {"title": "T", "version": "1.0"},
+        "paths": {
+            "/widgets": {
+                "get": {"responses": {"200": {"description": "ok"}}},
+                "post": {"responses": {"200": {"description": "ok"}}}
+            }
+        }
+    }"#,
+    )
+    .unwrap();
+    let tables = generate_all_tables(&spec, "srv", None, false, false);
+    assert_eq!(tables.len(), 1);
+    assert!(tables[0].contains("\"widgets\""), "{tables:?}");
+    let joined = tables.join("\n");
+    assert!(!joined.contains("widgets_post"), "{joined}");
+    assert!(!joined.contains("method 'POST'"), "{joined}");
+}
+
+#[test]
+fn test_generate_all_tables_dedups_colliding_names() {
+    // Distinct paths that normalize to the same identifier ('/a-b' and '/a.b' →
+    // 'a_b') each get a table; the second is suffixed rather than silently
+    // dropped by CREATE ... IF NOT EXISTS.
+    let spec = OpenApiSpec::from_str(
+        r#"{
+        "openapi": "3.0.0",
+        "info": {"title": "T", "version": "1.0"},
+        "paths": {
+            "/a-b": {"get": {"responses": {"200": {"description": "ok"}}}},
+            "/a.b": {"get": {"responses": {"200": {"description": "ok"}}}}
+        }
+    }"#,
+    )
+    .unwrap();
+    let tables = generate_all_tables(&spec, "srv", None, false, false);
+    assert_eq!(tables.len(), 2);
+    let joined = tables.join("\n");
+    assert!(joined.contains("\"a_b\""), "base name: {joined}");
+    assert!(joined.contains("\"a_b_1\""), "deduped name: {joined}");
+}
+
+#[test]
 fn test_generate_all_tables_limit_to() {
     let spec = make_test_spec();
     let filter = vec!["users".to_string(), "posts".to_string()];
@@ -542,7 +590,9 @@ fn test_extract_columns_github_type_arrays() {
 
 #[test]
 fn test_rowid_selection_no_id_column() {
-    // No 'id' column → picks first non-attrs non-jsonb column as rowid
+    // No 'id' column → rowid_column is omitted entirely. Guessing a non-'id'
+    // column (the old alphabetical fallback) could pick a non-unique field and
+    // silently mis-target single-resource reads and UPDATE/DELETE.
     let spec =
         OpenApiSpec::from_str(r#"{"openapi": "3.0.0", "info": {"title": "T"}, "paths": {}}"#)
             .unwrap();
@@ -576,10 +626,11 @@ fn test_rowid_selection_no_id_column() {
     };
 
     let table = generate_foreign_table(&endpoint, &spec, "test_server", false);
-    // 'metadata' is jsonb, so 'name' (text) should be the rowid
+    // No 'id' column present → no rowid_column emitted; the user must set one
+    // explicitly to enable single-resource reads or writes.
     assert!(
-        table.contains("rowid_column 'name'"),
-        "Expected name as rowid: {table}"
+        !table.contains("rowid_column"),
+        "Expected no rowid_column without an 'id' column: {table}"
     );
 }
 
@@ -1115,9 +1166,16 @@ fn test_generate_all_tables_post_method_in_ddl() {
     )
     .unwrap();
 
-    let tables = generate_all_tables(&spec, "api_server", None, false, false);
-    assert_eq!(tables.len(), 1);
-    let ddl = &tables[0];
+    // POST endpoints are not auto-imported; auto-import yields no tables here.
+    assert!(
+        generate_all_tables(&spec, "api_server", None, false, false).is_empty(),
+        "POST endpoints must not be auto-imported"
+    );
+
+    // Explicit generation still emits a POST table with the method option.
+    let endpoints = spec.endpoints();
+    let post = endpoints.iter().find(|e| e.method == "POST").unwrap();
+    let ddl = generate_foreign_table(post, &spec, "api_server", false);
     assert!(ddl.contains("\"search_post\""), "Table name: {ddl}");
     assert!(ddl.contains("method 'POST'"), "Method option: {ddl}");
     assert!(ddl.contains("endpoint '/search'"), "Endpoint option: {ddl}");
@@ -1204,7 +1262,7 @@ fn test_extract_columns_31_anyof_ref_and_null() {
     )
     .unwrap();
 
-    // Simulate what get_response_schema returns for anyOf: [$ref, null]
+    // Simulate what response_schema returns for anyOf: [$ref, null]
     let schema = crate::spec::Schema {
         any_of: vec![
             crate::spec::Schema {
@@ -1746,11 +1804,89 @@ fn test_full_ddl_31_stripe_expandable_field() {
     assert_eq!(tables.len(), 1);
     let ddl = &tables[0];
 
-    // The response is an object with a "data" array — extract_columns sees the top-level object,
-    // which has a "data" property of type array → jsonb column
-    // This verifies that wrapper objects don't get their inner items extracted at DDL time
-    // (that's a runtime concern handled by extract_data auto-detection)
-    assert!(ddl.contains("\"data\" jsonb"), "data wrapper: {ddl}");
+    // Schema generation unwraps the `data` array envelope to match runtime
+    // extraction, so the columns are the Charge record's fields — not a single
+    // `data` jsonb column — and response_path is pinned to '/data'.
+    assert!(
+        !ddl.contains("\"data\" jsonb"),
+        "data must not be modeled as a column: {ddl}"
+    );
+    assert!(
+        ddl.contains("response_path '/data'"),
+        "response_path pinned to the envelope: {ddl}"
+    );
+    assert!(ddl.contains("\"id\" text NOT NULL"), "id: {ddl}");
+    assert!(ddl.contains("\"amount\" bigint"), "amount: {ddl}");
+    assert!(ddl.contains("\"currency\" text"), "currency: {ddl}");
+    assert!(ddl.contains("\"created\" timestamptz"), "created: {ddl}");
+    // Expandable anyOf [string, $ref] still collapses to jsonb.
+    assert!(ddl.contains("\"customer\" jsonb"), "customer: {ddl}");
+    // rowid derives from the real 'id' field, not a wrapper field.
+    assert!(ddl.contains("rowid_column 'id'"), "rowid: {ddl}");
+}
+
+#[test]
+fn test_full_ddl_results_envelope_no_id() {
+    // A `results` array envelope is unwrapped and response_path is pinned; with
+    // no 'id' field on the record, rowid_column is omitted, and the wrapper key
+    // and its metadata siblings never become columns.
+    let spec = OpenApiSpec::from_str(
+        r##"{
+        "openapi": "3.0.0",
+        "info": {"title": "T", "version": "1.0"},
+        "paths": {
+            "/search": {
+                "get": {
+                    "responses": {
+                        "200": {
+                            "description": "ok",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "results": {
+                                                "type": "array",
+                                                "items": {
+                                                    "type": "object",
+                                                    "properties": {
+                                                        "title": {"type": "string"},
+                                                        "score": {"type": "number"}
+                                                    }
+                                                }
+                                            },
+                                            "total": {"type": "integer"}
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }"##,
+    )
+    .unwrap();
+
+    let tables = generate_all_tables(&spec, "srv", None, false, false);
+    assert_eq!(tables.len(), 1);
+    let ddl = &tables[0];
+    assert!(
+        ddl.contains("response_path '/results'"),
+        "response_path: {ddl}"
+    );
+    assert!(ddl.contains("\"title\" text"), "title: {ddl}");
+    assert!(ddl.contains("\"score\" double precision"), "score: {ddl}");
+    assert!(
+        !ddl.contains("\"total\""),
+        "wrapper sibling not a column: {ddl}"
+    );
+    assert!(
+        !ddl.contains("\"results\""),
+        "wrapper key not a column: {ddl}"
+    );
+    assert!(!ddl.contains("rowid_column"), "no id → no rowid: {ddl}");
 }
 
 #[test]
@@ -1919,9 +2055,16 @@ fn test_full_ddl_31_post_for_read_with_composition() {
     )
     .unwrap();
 
-    let tables = generate_all_tables(&spec, "search_server", None, false, false);
-    assert_eq!(tables.len(), 1);
-    let ddl = &tables[0];
+    // POST endpoints are not auto-imported (a plain SELECT could trigger a
+    // remote side effect), but a POST table can still be generated explicitly —
+    // which is what exercises the allOf-composition column extraction here.
+    assert!(
+        generate_all_tables(&spec, "search_server", None, false, false).is_empty(),
+        "POST endpoints must not be auto-imported"
+    );
+    let endpoints = spec.endpoints();
+    let post = endpoints.iter().find(|e| e.method == "POST").unwrap();
+    let ddl = generate_foreign_table(post, &spec, "search_server", false);
 
     // POST table name
     assert!(ddl.contains("\"search_post\""), "table name: {ddl}");

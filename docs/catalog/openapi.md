@@ -211,6 +211,24 @@ import foreign schema openapi
 !!! note
     `IMPORT FOREIGN SCHEMA` only generates tables for non-parameterized GET endpoints (e.g., `/users`, `/orders`). Endpoints with path parameters like `/users/{user_id}/posts` are skipped because they require WHERE clause values at query time. Create these tables manually using the `endpoint` option with `{param}` placeholders — see [Path Parameters](#path-parameters) for examples.
 
+!!! warning "Changed in 0.3.0"
+    Two `IMPORT FOREIGN SCHEMA` behaviors changed. Both make generated tables safer, and both can require action on an existing setup:
+
+    **`rowid_column` is emitted only when the record has an `id` field.** Earlier versions fell back to "the first non-`attrs`, non-`jsonb` column" in alphabetical order, which could select a non-unique field such as `amount`, `name` or `status`. That is actively dangerous: the read path treats any `=` filter on the rowid column as a [single-resource lookup](#single-resource-access), and `UPDATE`/`DELETE` address the remote resource by it — so a wrong choice silently targets the wrong record. Tables whose record has no `id` field are now imported without a `rowid_column`; add it explicitly:
+
+    ```sql
+    alter foreign table api.orders options (add rowid_column 'order_number');
+    ```
+
+    Re-import after upgrading and check for tables that lost the option, particularly any table you write to.
+
+    **POST endpoints are no longer imported.** A POST endpoint is usually a create, and a plain `SELECT` on such a table would trigger a remote side effect. (The `Operation` model also cannot send a request body, so an auto-imported POST-as-search table would not have worked.) Create POST-backed tables manually with the intended `method` and `request_body` options — see [POST-for-Read Endpoints](#post-for-read-endpoints).
+
+!!! note "Envelope handling during import"
+    When a response schema is an envelope whose wrapper key (`data`, `results`, `items`, ...) holds an **array**, the generated columns come from the record inside it and a matching `response_path` is emitted, so import and query time agree on the row shape.
+
+    An envelope whose wrapper key holds a single **object** (e.g. `{"data": {...}, "meta": {...}}`) is not unwrapped during import, though `extract_data` does unwrap it at query time. For that shape the generated columns describe the envelope rather than the record. It is rare on a collection endpoint; if you hit it, set the table's columns and `response_path` manually.
+
 ## Path Parameters
 
 The OpenAPI FDW supports path parameter substitution. Define parameters in the endpoint template using `{param_name}` syntax, and provide values via WHERE clauses:
@@ -465,6 +483,14 @@ Debug output includes:
 - Response status code and body size
 - Total rows fetched and pages retrieved
 - Pagination details
+- A configured `response_path` that was not found in the response (extraction fell back to auto-detection)
+- Columns that read as `NULL` because the value could not be converted to the column's Postgres type
+- Columns that read as `NULL` because the JSON key matched only case-insensitively or after normalization (see below)
+
+!!! tip "Diagnosing a column that is unexpectedly all NULL"
+    Column-to-key matching is resolved once, from the first row of the first page. A column absent from that row is retried per row using only the exact and camelCase key lookups, so a key that appears in later rows under a different case or with punctuation (`User_Name`, `@id`) is not selected and the column reads `NULL`.
+
+    Debug mode names the key it found, so the fix is usually to rename the column to match the API key exactly, or to add an explicit `response_path` if the wrong object is being scanned. Note that debug mode only reports — it never changes which value is selected.
 
 ## Pagination
 

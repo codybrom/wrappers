@@ -53,6 +53,21 @@ fn test_endpoint_table_name() {
 }
 
 #[test]
+fn test_endpoint_table_name_all_separators_falls_back() {
+    // A path made entirely of separators collapses to empty AFTER sanitization;
+    // it must fall back to a stable default, never an invalid empty identifier
+    // that would abort the whole IMPORT.
+    for path in ["/_", "/---", "/./.", "/-", "/.$."] {
+        let endpoint = EndpointInfo {
+            path: path.to_string(),
+            method: "GET",
+            response_schema: None,
+        };
+        assert_eq!(endpoint.table_name(), "unknown", "path {path}");
+    }
+}
+
+#[test]
 fn test_resolve_ref() {
     let spec_json = r#"{
         "openapi": "3.0.0",
@@ -415,7 +430,7 @@ fn test_openapi_31_type_mapping_with_spec() {
     }"#;
 
     let spec = OpenApiSpec::from_str(spec_json).unwrap();
-    let endpoints = spec.get_endpoints();
+    let endpoints = spec.endpoints();
     assert_eq!(endpoints.len(), 1);
 
     let schema = endpoints[0].response_schema.as_ref().unwrap();
@@ -646,7 +661,7 @@ fn test_parameterized_paths_excluded_from_endpoints() {
     }"#;
 
     let spec = OpenApiSpec::from_str(spec_json).unwrap();
-    let endpoints = spec.get_endpoints();
+    let endpoints = spec.endpoints();
 
     // Only /items should be included — parameterized paths are excluded
     assert_eq!(endpoints.len(), 1);
@@ -685,7 +700,7 @@ fn test_response_schema_from_201() {
     }"#;
 
     let spec = OpenApiSpec::from_str(spec_json).unwrap();
-    let endpoints = spec.get_endpoints();
+    let endpoints = spec.endpoints();
     assert_eq!(endpoints.len(), 1);
 
     let schema = endpoints[0].response_schema.as_ref().unwrap();
@@ -713,7 +728,7 @@ fn test_no_schema_endpoint() {
     }"#;
 
     let spec = OpenApiSpec::from_str(spec_json).unwrap();
-    let endpoints = spec.get_endpoints();
+    let endpoints = spec.endpoints();
     assert_eq!(endpoints.len(), 1);
     assert!(endpoints[0].response_schema.is_none());
 }
@@ -890,7 +905,7 @@ fn test_resolve_schema_allof_with_ref_and_inline() {
     }"##;
 
     let spec = OpenApiSpec::from_str(spec_json).unwrap();
-    let endpoints = spec.get_endpoints();
+    let endpoints = spec.endpoints();
     let schema = endpoints[0].response_schema.as_ref().unwrap();
     let items = schema.items.as_ref().unwrap();
     let resolved = spec.resolve_schema(items);
@@ -982,7 +997,7 @@ fn test_get_response_schema_default_response() {
     }"#;
 
     let spec = OpenApiSpec::from_str(spec_json).unwrap();
-    let endpoints = spec.get_endpoints();
+    let endpoints = spec.endpoints();
     assert_eq!(endpoints.len(), 1);
     let schema = endpoints[0].response_schema.as_ref().unwrap();
     assert!(schema.properties.contains_key("id"));
@@ -1020,7 +1035,7 @@ fn test_get_response_schema_non_json_content_type() {
     }"#;
 
     let spec = OpenApiSpec::from_str(spec_json).unwrap();
-    let endpoints = spec.get_endpoints();
+    let endpoints = spec.endpoints();
     assert_eq!(endpoints.len(), 1);
     let schema = endpoints[0].response_schema.as_ref().unwrap();
     assert!(schema.properties.contains_key("type"));
@@ -1048,7 +1063,7 @@ fn test_paths_without_get_include_post() {
     }"#;
 
     let spec = OpenApiSpec::from_str(spec_json).unwrap();
-    let endpoints = spec.get_endpoints();
+    let endpoints = spec.endpoints();
     assert_eq!(endpoints.len(), 2);
     assert_eq!(endpoints[0].path, "/items");
     assert_eq!(endpoints[0].method, "GET");
@@ -1132,7 +1147,7 @@ fn test_response_ref_resolution() {
     }"##;
 
     let spec = OpenApiSpec::from_str(spec_json).unwrap();
-    let endpoints = spec.get_endpoints();
+    let endpoints = spec.endpoints();
     assert_eq!(endpoints.len(), 1);
     let schema = endpoints[0].response_schema.as_ref().unwrap();
     let items = schema.items.as_ref().unwrap();
@@ -1172,7 +1187,7 @@ fn test_response_schema_from_2xx_wildcard() {
     }"#;
 
     let spec = OpenApiSpec::from_str(spec_json).unwrap();
-    let endpoints = spec.get_endpoints();
+    let endpoints = spec.endpoints();
     assert_eq!(endpoints.len(), 1);
     let schema = endpoints[0].response_schema.as_ref().unwrap();
     assert!(schema.properties.contains_key("id"));
@@ -1222,7 +1237,7 @@ fn test_200_preferred_over_2xx() {
     }"#;
 
     let spec = OpenApiSpec::from_str(spec_json).unwrap();
-    let endpoints = spec.get_endpoints();
+    let endpoints = spec.endpoints();
     let schema = endpoints[0].response_schema.as_ref().unwrap();
     assert!(schema.properties.contains_key("from_200"));
     assert!(!schema.properties.contains_key("from_2xx"));
@@ -1386,7 +1401,7 @@ fn test_endpoints_sorted_alphabetically() {
     }"#;
 
     let spec = OpenApiSpec::from_str(spec_json).unwrap();
-    let endpoints = spec.get_endpoints();
+    let endpoints = spec.endpoints();
     assert_eq!(endpoints.len(), 3);
     assert_eq!(endpoints[0].path, "/apples");
     assert_eq!(endpoints[1].path, "/middle");
@@ -1423,7 +1438,7 @@ fn test_response_schema_charset_content_type() {
     }"#;
 
     let spec = OpenApiSpec::from_str(spec_json).unwrap();
-    let endpoints = spec.get_endpoints();
+    let endpoints = spec.endpoints();
     assert_eq!(endpoints.len(), 1);
     let schema = endpoints[0].response_schema.as_ref().unwrap();
     assert!(schema.properties.contains_key("id"));
@@ -1467,7 +1482,7 @@ fn test_response_schema_json_preferred_over_xml() {
     }"#;
 
     let spec = OpenApiSpec::from_str(spec_json).unwrap();
-    let endpoints = spec.get_endpoints();
+    let endpoints = spec.endpoints();
     assert_eq!(endpoints.len(), 1);
     let schema = endpoints[0].response_schema.as_ref().unwrap();
     assert!(schema.properties.contains_key("json_field"));
@@ -1588,7 +1603,7 @@ fn test_post_endpoint_included() {
     }"#;
 
     let spec = OpenApiSpec::from_str(spec_json).unwrap();
-    let endpoints = spec.get_endpoints();
+    let endpoints = spec.endpoints();
     assert_eq!(endpoints.len(), 1);
     assert_eq!(endpoints[0].path, "/search");
     assert_eq!(endpoints[0].method, "POST");
@@ -1630,7 +1645,7 @@ fn test_get_and_post_same_path() {
     }"#;
 
     let spec = OpenApiSpec::from_str(spec_json).unwrap();
-    let endpoints = spec.get_endpoints();
+    let endpoints = spec.endpoints();
     assert_eq!(endpoints.len(), 2);
     // Sorted by path then method, so GET comes first
     assert_eq!(endpoints[0].method, "GET");
@@ -1656,7 +1671,7 @@ fn test_parameterized_post_excluded() {
     }"#;
 
     let spec = OpenApiSpec::from_str(spec_json).unwrap();
-    let endpoints = spec.get_endpoints();
+    let endpoints = spec.endpoints();
     assert_eq!(endpoints.len(), 0);
 }
 
@@ -1681,7 +1696,7 @@ fn test_post_only_path() {
     }"#;
 
     let spec = OpenApiSpec::from_str(spec_json).unwrap();
-    let endpoints = spec.get_endpoints();
+    let endpoints = spec.endpoints();
     assert_eq!(endpoints.len(), 2);
     assert!(
         endpoints
@@ -1949,7 +1964,7 @@ fn test_content_type_jsonld() {
     }"#;
 
     let spec = OpenApiSpec::from_str(spec_json).unwrap();
-    let endpoints = spec.get_endpoints();
+    let endpoints = spec.endpoints();
     assert_eq!(endpoints.len(), 1);
     let schema = endpoints[0].response_schema.as_ref().unwrap();
     assert!(schema.properties.contains_key("@graph"));
@@ -1986,7 +2001,7 @@ fn test_content_type_jsonapi() {
     }"#;
 
     let spec = OpenApiSpec::from_str(spec_json).unwrap();
-    let endpoints = spec.get_endpoints();
+    let endpoints = spec.endpoints();
     assert_eq!(endpoints.len(), 1);
     let schema = endpoints[0].response_schema.as_ref().unwrap();
     assert!(schema.properties.contains_key("data"));
@@ -2060,7 +2075,7 @@ fn test_stripe_metadata_additional_properties() {
     }"#;
 
     let spec = OpenApiSpec::from_str(spec_json).unwrap();
-    let endpoints = spec.get_endpoints();
+    let endpoints = spec.endpoints();
     let schema = endpoints[0].response_schema.as_ref().unwrap();
     let metadata = schema.properties.get("metadata").unwrap();
     // type: "object" with no properties → maps to jsonb
@@ -2248,7 +2263,7 @@ fn test_github_31_nullable_simple_user_ref() {
     }"##;
 
     let spec = OpenApiSpec::from_str(spec_json).unwrap();
-    let endpoints = spec.get_endpoints();
+    let endpoints = spec.endpoints();
     assert_eq!(endpoints.len(), 1);
 
     let schema = endpoints[0].response_schema.as_ref().unwrap();
@@ -2380,7 +2395,7 @@ fn test_stripe_31_expandable_field_string_or_ref() {
     }"##;
 
     let spec = OpenApiSpec::from_str(spec_json).unwrap();
-    let endpoints = spec.get_endpoints();
+    let endpoints = spec.endpoints();
     assert_eq!(endpoints.len(), 1);
 
     let schema = endpoints[0].response_schema.as_ref().unwrap();
@@ -2507,7 +2522,7 @@ fn test_response_ref_chain_through_components() {
     }"##;
 
     let spec = OpenApiSpec::from_str(spec_json).unwrap();
-    let endpoints = spec.get_endpoints();
+    let endpoints = spec.endpoints();
     assert_eq!(endpoints.len(), 1);
 
     let schema = endpoints[0].response_schema.as_ref().unwrap();
@@ -2654,7 +2669,7 @@ fn test_twilio_nested_schema_ref_in_response() {
     }"##;
 
     let spec = OpenApiSpec::from_str(spec_json).unwrap();
-    let endpoints = spec.get_endpoints();
+    let endpoints = spec.endpoints();
     assert_eq!(endpoints.len(), 1);
 
     let schema = endpoints[0].response_schema.as_ref().unwrap();
@@ -2725,7 +2740,7 @@ fn test_empty_paths_valid_spec() {
     }"#;
 
     let spec = OpenApiSpec::from_str(spec_json).unwrap();
-    let endpoints = spec.get_endpoints();
+    let endpoints = spec.endpoints();
     assert!(endpoints.is_empty());
 }
 
@@ -2871,7 +2886,7 @@ fn test_response_schema_from_array_ref() {
     }"##;
 
     let spec = OpenApiSpec::from_str(spec_json).unwrap();
-    let endpoints = spec.get_endpoints();
+    let endpoints = spec.endpoints();
     assert_eq!(endpoints.len(), 1);
 
     // The response schema is a $ref to UserList (array type)
@@ -2981,7 +2996,7 @@ fn test_response_ref_broken_gracefully() {
     }"##;
 
     let spec = OpenApiSpec::from_str(spec_json).unwrap();
-    let endpoints = spec.get_endpoints();
+    let endpoints = spec.endpoints();
     assert_eq!(endpoints.len(), 1);
     // Broken ref → no schema
     assert!(endpoints[0].response_schema.is_none());
@@ -3068,7 +3083,7 @@ fn test_response_only_error_codes() {
     }"#;
 
     let spec = OpenApiSpec::from_str(spec_json).unwrap();
-    let endpoints = spec.get_endpoints();
+    let endpoints = spec.endpoints();
     assert_eq!(endpoints.len(), 1);
     // No 200/201/2XX/default → response_schema should be None
     assert!(endpoints[0].response_schema.is_none());
@@ -3336,7 +3351,7 @@ fn test_github_31_readonly_property_included() {
     }"#;
 
     let spec = OpenApiSpec::from_str(spec_json).unwrap();
-    let endpoints = spec.get_endpoints();
+    let endpoints = spec.endpoints();
     assert_eq!(endpoints.len(), 1);
 
     let schema = endpoints[0].response_schema.as_ref().unwrap();
@@ -3451,7 +3466,7 @@ fn test_kubernetes_implicit_object_no_type() {
     }"#;
 
     let spec = OpenApiSpec::from_str(spec_json).unwrap();
-    let endpoints = spec.get_endpoints();
+    let endpoints = spec.endpoints();
     assert_eq!(endpoints.len(), 1);
 
     let schema = endpoints[0].response_schema.as_ref().unwrap();
@@ -3746,7 +3761,7 @@ fn test_31_deprecated_property_still_included() {
     }"#;
 
     let spec = OpenApiSpec::from_str(spec_json).unwrap();
-    let endpoints = spec.get_endpoints();
+    let endpoints = spec.endpoints();
     assert_eq!(endpoints.len(), 1);
 
     let schema = endpoints[0].response_schema.as_ref().unwrap();
@@ -3792,7 +3807,7 @@ fn test_31_deprecated_operation_still_included() {
     }"#;
 
     let spec = OpenApiSpec::from_str(spec_json).unwrap();
-    let endpoints = spec.get_endpoints();
+    let endpoints = spec.endpoints();
     // Deprecated operations should still be discovered
     assert_eq!(endpoints.len(), 1);
     assert!(endpoints[0].response_schema.is_some());
@@ -3845,7 +3860,7 @@ fn test_31_post_for_read_with_type_arrays() {
     }"#;
 
     let spec = OpenApiSpec::from_str(spec_json).unwrap();
-    let endpoints = spec.get_endpoints();
+    let endpoints = spec.endpoints();
     assert_eq!(endpoints.len(), 1);
     assert_eq!(endpoints[0].method, "POST");
     assert_eq!(endpoints[0].table_name(), "search_post");
@@ -3919,7 +3934,7 @@ fn test_31_response_ref_to_allof_schema() {
     }"##;
 
     let spec = OpenApiSpec::from_str(spec_json).unwrap();
-    let endpoints = spec.get_endpoints();
+    let endpoints = spec.endpoints();
     assert_eq!(endpoints.len(), 1);
 
     let schema = endpoints[0].response_schema.as_ref().unwrap();
@@ -4194,7 +4209,7 @@ fn test_31_full_e2e_github_style_spec() {
     assert_eq!(spec.base_url(), Some("https://api.github.com".to_string()));
 
     // Should have 3 endpoints: GET /repos, POST /repos/search, GET /notifications
-    let endpoints = spec.get_endpoints();
+    let endpoints = spec.endpoints();
     assert_eq!(endpoints.len(), 3);
 
     // Endpoints should be sorted
@@ -4333,7 +4348,7 @@ fn test_31_full_e2e_stripe_style_spec() {
     }"##;
 
     let spec = OpenApiSpec::from_str(spec_json).unwrap();
-    let endpoints = spec.get_endpoints();
+    let endpoints = spec.endpoints();
     assert_eq!(endpoints.len(), 1);
 
     let schema = endpoints[0].response_schema.as_ref().unwrap();
@@ -4502,7 +4517,7 @@ fn test_response_only_binary_content() {
     }"#;
 
     let spec = OpenApiSpec::from_str(spec_json).unwrap();
-    let endpoints = spec.get_endpoints();
+    let endpoints = spec.endpoints();
     assert_eq!(endpoints.len(), 1);
     // Should fall back to the only available content type
     let schema = endpoints[0].response_schema.as_ref().unwrap();
@@ -4570,7 +4585,7 @@ fn test_31_triple_indirection_response_ref_allof_ref() {
     }"##;
 
     let spec = OpenApiSpec::from_str(spec_json).unwrap();
-    let endpoints = spec.get_endpoints();
+    let endpoints = spec.endpoints();
     assert_eq!(endpoints.len(), 1);
 
     let schema = endpoints[0].response_schema.as_ref().unwrap();
@@ -4773,7 +4788,7 @@ fn test_31_response_201_with_type_arrays() {
     }"#;
 
     let spec = OpenApiSpec::from_str(spec_json).unwrap();
-    let endpoints = spec.get_endpoints();
+    let endpoints = spec.endpoints();
     assert_eq!(endpoints.len(), 1);
 
     let schema = endpoints[0].response_schema.as_ref().unwrap();
@@ -4819,7 +4834,7 @@ fn test_31_response_2xx_with_type_arrays() {
     }"#;
 
     let spec = OpenApiSpec::from_str(spec_json).unwrap();
-    let endpoints = spec.get_endpoints();
+    let endpoints = spec.endpoints();
     assert_eq!(endpoints.len(), 1);
 
     let schema = endpoints[0].response_schema.as_ref().unwrap();
@@ -4866,7 +4881,7 @@ fn test_31_response_default_only_with_type_arrays() {
     }"#;
 
     let spec = OpenApiSpec::from_str(spec_json).unwrap();
-    let endpoints = spec.get_endpoints();
+    let endpoints = spec.endpoints();
     assert_eq!(endpoints.len(), 1);
 
     let schema = endpoints[0].response_schema.as_ref().unwrap();
@@ -4945,7 +4960,7 @@ fn test_31_response_priority_all_codes_with_type_arrays() {
     }"#;
 
     let spec = OpenApiSpec::from_str(spec_json).unwrap();
-    let endpoints = spec.get_endpoints();
+    let endpoints = spec.endpoints();
     let schema = endpoints[0].response_schema.as_ref().unwrap();
 
     // 200 should win
@@ -5001,7 +5016,7 @@ fn test_31_non_json_content_type_with_type_arrays() {
     }"#;
 
     let spec = OpenApiSpec::from_str(spec_json).unwrap();
-    let endpoints = spec.get_endpoints();
+    let endpoints = spec.endpoints();
     assert_eq!(endpoints.len(), 1);
 
     let schema = endpoints[0].response_schema.as_ref().unwrap();
@@ -5053,7 +5068,7 @@ fn test_31_response_ref_with_type_arrays() {
     }"##;
 
     let spec = OpenApiSpec::from_str(spec_json).unwrap();
-    let endpoints = spec.get_endpoints();
+    let endpoints = spec.endpoints();
     assert_eq!(endpoints.len(), 1);
 
     let schema = endpoints[0].response_schema.as_ref().unwrap();
@@ -5125,7 +5140,7 @@ fn test_31_get_post_same_path_different_schemas() {
     }"#;
 
     let spec = OpenApiSpec::from_str(spec_json).unwrap();
-    let endpoints = spec.get_endpoints();
+    let endpoints = spec.endpoints();
     assert_eq!(endpoints.len(), 2);
 
     // GET comes first (alphabetically by method)
@@ -5558,7 +5573,7 @@ paths:
 "#;
     let spec = OpenApiSpec::from_yaml_str(yaml).unwrap();
     assert_eq!(spec.openapi, "3.0.0");
-    let endpoints = spec.get_endpoints();
+    let endpoints = spec.endpoints();
     assert_eq!(endpoints.len(), 1);
     assert_eq!(endpoints[0].path, "/users");
 }
@@ -5594,7 +5609,7 @@ components:
           type: string
 "##;
     let spec = OpenApiSpec::from_yaml_str(yaml).unwrap();
-    let endpoints = spec.get_endpoints();
+    let endpoints = spec.endpoints();
     assert_eq!(endpoints.len(), 1);
     let schema = endpoints[0].response_schema.as_ref().unwrap();
     let items = schema.items.as_ref().unwrap();
@@ -5633,7 +5648,7 @@ paths:
     let spec = OpenApiSpec::from_yaml_str(yaml).unwrap();
     assert_eq!(spec.openapi, "3.1.0");
     assert_eq!(spec.base_url(), Some("https://api.example.com".to_string()));
-    let endpoints = spec.get_endpoints();
+    let endpoints = spec.endpoints();
     assert_eq!(endpoints.len(), 1);
     let schema = endpoints[0].response_schema.as_ref().unwrap();
     let label = schema.properties.get("label").unwrap();
@@ -5707,8 +5722,8 @@ paths:
     let json_spec = OpenApiSpec::from_str(json).unwrap();
     let yaml_spec = OpenApiSpec::from_yaml_str(yaml).unwrap();
 
-    let json_endpoints = json_spec.get_endpoints();
-    let yaml_endpoints = yaml_spec.get_endpoints();
+    let json_endpoints = json_spec.endpoints();
+    let yaml_endpoints = yaml_spec.endpoints();
     assert_eq!(json_endpoints.len(), yaml_endpoints.len());
     assert_eq!(json_endpoints[0].path, yaml_endpoints[0].path);
 

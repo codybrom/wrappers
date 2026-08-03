@@ -133,7 +133,13 @@ pub(crate) struct PathItem {
     pub post: Option<Operation>,
 }
 
-/// Operation definition
+/// Operation definition.
+///
+/// Only the response schema is modeled today (used to derive table columns).
+/// `parameters` and `requestBody` are intentionally not captured yet: surfacing
+/// required query/header parameters or write-only body fields would also want a
+/// warning at import time, which needs host access unavailable in the host-less
+/// endpoint-extraction path.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Operation {
@@ -243,7 +249,7 @@ impl OpenApiSpec {
     /// query time. Users should create these tables manually with the appropriate
     /// endpoint option containing {param} placeholders. See the documentation
     /// for path parameter examples.
-    pub fn get_endpoints(&self) -> Vec<EndpointInfo> {
+    pub fn endpoints(&self) -> Vec<EndpointInfo> {
         let mut endpoints = Vec::new();
 
         for (path, path_item) in &self.paths {
@@ -254,7 +260,7 @@ impl OpenApiSpec {
             }
 
             if let Some(ref op) = path_item.get {
-                let response_schema = self.get_response_schema(op);
+                let response_schema = self.response_schema(op);
                 endpoints.push(EndpointInfo {
                     path: path.clone(),
                     method: "GET",
@@ -263,7 +269,7 @@ impl OpenApiSpec {
             }
 
             if let Some(ref op) = path_item.post {
-                let response_schema = self.get_response_schema(op);
+                let response_schema = self.response_schema(op);
                 endpoints.push(EndpointInfo {
                     path: path.clone(),
                     method: "POST",
@@ -280,7 +286,7 @@ impl OpenApiSpec {
     const SUCCESS_RESPONSE_CODES: &[&str] = &["200", "201", "2XX", "default"];
 
     /// Get the response schema for a successful response (200, 201, 2XX, or default)
-    fn get_response_schema(&self, op: &Operation) -> Option<Schema> {
+    fn response_schema(&self, op: &Operation) -> Option<Schema> {
         let response = Self::SUCCESS_RESPONSE_CODES
             .iter()
             .find_map(|code| op.responses.get(*code))?;
@@ -349,7 +355,12 @@ impl OpenApiSpec {
         let count = call_count.get() + 1;
         call_count.set(count);
 
-        // Guard against circular references and exponential blowup
+        // Guard against circular references and exponential blowup. Hitting
+        // either cap returns the schema with its $ref/composition only partially
+        // resolved, so a table generated from it may be missing columns. This is
+        // a deliberate safety limit for adversarial/degenerate specs; surfacing a
+        // warning would require host access that this pure resolution layer (and
+        // its host-less unit tests) does not have.
         if depth > Self::MAX_RESOLVE_DEPTH || count > Self::MAX_RESOLVE_CALLS {
             return schema.clone();
         }
@@ -544,35 +555,37 @@ impl EndpointInfo {
     ///
     /// Uses the full path to avoid collisions (e.g., /v1/users and /v2/users
     /// become v1_users and v2_users instead of both becoming users).
-    /// POST endpoints get a _post suffix to avoid collisions with GET tables.
+    ///
+    /// POST endpoints get a `_post` suffix to avoid colliding with the GET
+    /// table for the same path. Note that `generate_all_tables` no longer
+    /// auto-imports POST endpoints (a plain SELECT on one could trigger a
+    /// remote create), so this suffix is reached only when a caller names a
+    /// POST endpoint explicitly.
     pub fn table_name(&self) -> String {
+        // Sanitize the path into a SQL identifier in a single pass: every run of
+        // non-alphanumeric characters (/, -, ., _, etc.) collapses to a single
+        // '_', and a trailing '_' is trimmed. Building it in one pass avoids the
+        // repeated allocating "__"→"_" collapse.
         let cleaned = self.path.trim_matches('/');
-
-        let mut base = if cleaned.is_empty() {
-            "unknown".to_string()
-        } else {
-            // Join path segments with '_' and convert kebab-case to snake_case
-            let mut name = cleaned.replace(['/', '-'], "_");
-            // Replace remaining non-alphanumeric/non-underscore chars with '_'
-            name = name
-                .chars()
-                .map(|c| {
-                    if c.is_alphanumeric() || c == '_' {
-                        c
-                    } else {
-                        '_'
-                    }
-                })
-                .collect();
-            // Collapse consecutive underscores
-            while name.contains("__") {
-                name = name.replace("__", "_");
+        let mut base = String::with_capacity(cleaned.len());
+        for c in cleaned.chars() {
+            if c.is_alphanumeric() {
+                base.push(c);
+            } else if !base.ends_with('_') {
+                base.push('_');
             }
-            // Trim trailing underscores
-            name.trim_end_matches('_').to_string()
-        };
+        }
+        let mut base = base.trim_end_matches('_').to_string();
 
-        // Prepend '_' if starts with digit
+        // A path that is empty or made entirely of separators (e.g. '/', '/_',
+        // '/---') collapses to nothing. Re-check emptiness AFTER sanitizing and
+        // fall back to a stable default so we never emit an invalid empty quoted
+        // identifier that aborts the whole IMPORT.
+        if base.is_empty() {
+            base = "unknown".to_string();
+        }
+
+        // Prepend '_' if it starts with a digit (invalid identifier start)
         if base.starts_with(|c: char| c.is_ascii_digit()) {
             base.insert(0, '_');
         }
