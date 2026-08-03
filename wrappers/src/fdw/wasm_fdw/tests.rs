@@ -1258,4 +1258,367 @@ mod tests {
         });
         assert!(result.is_err());
     }
+
+    // Create the wasm FDW handler, a spec-backed OpenAPI server, and the target
+    // schema, then run IMPORT FOREIGN SCHEMA. Used by the openapi_import_* tests.
+    // The spec is served by the mock at /openapi/spec -- see IMPORT_SPEC in
+    // server.py for the shape and why each path is there.
+    fn import_openapi_schema(c: &mut pgrx::spi::SpiClient<'_>) {
+        c.update(
+            r#"CREATE FOREIGN DATA WRAPPER wasm_wrapper
+                 HANDLER wasm_fdw_handler VALIDATOR wasm_fdw_validator"#,
+            None,
+            &[],
+        )
+        .unwrap();
+
+        c.update(
+            r#"CREATE SERVER openapi_import_server
+                 FOREIGN DATA WRAPPER wasm_wrapper
+                 OPTIONS (
+                   fdw_package_url 'file://../../../wasm-wrappers/fdw/target/wasm32-unknown-unknown/release/openapi_fdw.wasm',
+                   fdw_package_name 'supabase:openapi-fdw',
+                   fdw_package_version '>=0.1.0',
+                   base_url 'http://localhost:8096/openapi',
+                   spec_url 'http://localhost:8096/openapi/spec'
+                 )"#,
+            None,
+            &[],
+        )
+        .unwrap();
+
+        c.update("CREATE SCHEMA api", None, &[]).unwrap();
+        c.update(
+            "IMPORT FOREIGN SCHEMA openapi FROM SERVER openapi_import_server INTO api",
+            None,
+            &[],
+        )
+        .unwrap();
+    }
+
+    // Read one foreign table's options as a text[] predicate result.
+    fn ft_option_matches(c: &mut pgrx::spi::SpiClient<'_>, relname: &str, pred: &str) -> bool {
+        let sql = format!(
+            "SELECT {pred} AS matched FROM pg_foreign_table ft \
+             JOIN pg_class cl ON cl.oid = ft.ftrelid \
+             JOIN pg_namespace n ON n.oid = cl.relnamespace \
+             WHERE n.nspname = 'api' AND cl.relname = '{relname}'"
+        );
+        c.select(&sql, None, &[])
+            .unwrap()
+            .filter_map(|r| r.get_by_name::<bool, _>("matched").unwrap())
+            .next()
+            .unwrap_or_else(|| panic!("foreign table api.{relname} not found"))
+    }
+
+    // An envelope response ({data: [Record]}) must generate columns from the
+    // RECORD, plus a response_path pinning runtime extraction to the very
+    // envelope those columns came from. Previously the envelope object itself
+    // was modeled as the row, producing all-NULL rows for the most common REST
+    // list shape.
+    #[pg_test]
+    fn openapi_import_generates_record_columns_and_response_path() {
+        Spi::connect_mut(|c| {
+            import_openapi_schema(c);
+
+            assert!(
+                ft_option_matches(c, "things", "'response_path=/data' = ANY(ftoptions)"),
+                "things should pin response_path to the envelope it was derived from"
+            );
+            assert!(
+                ft_option_matches(c, "things", "'rowid_column=id' = ANY(ftoptions)"),
+                "things has an 'id' field so rowid_column should be emitted"
+            );
+
+            // The generated columns must actually select real record data --
+            // this is what all-NULL rows looked like before.
+            let names = c
+                .select(r#"SELECT name FROM api.things"#, None, &[])
+                .unwrap()
+                .filter_map(|r| r.get_by_name::<&str, _>("name").unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(names, vec!["Thing One"]);
+
+            let counts = c
+                .select(r#"SELECT "count" FROM api.things"#, None, &[])
+                .unwrap()
+                .filter_map(|r| r.get_by_name::<i64, _>("count").unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(counts, vec![5]);
+        });
+    }
+
+    // A record with no 'id' field must yield a table with NO rowid_column. The
+    // old alphabetical fallback could pick a non-unique column (here 'label' or
+    // 'sku'), which the read path would then treat as a single-resource lookup
+    // and UPDATE/DELETE would address the wrong remote resource.
+    #[pg_test]
+    fn openapi_import_omits_rowid_without_id_field() {
+        Spi::connect_mut(|c| {
+            import_openapi_schema(c);
+
+            // The table itself is still generated and readable...
+            let skus = c
+                .select("SELECT sku FROM api.widgets", None, &[])
+                .unwrap()
+                .filter_map(|r| r.get_by_name::<&str, _>("sku").unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(skus, vec!["w-1"]);
+
+            // ...but carries no rowid_column at all.
+            assert!(
+                !ft_option_matches(
+                    c,
+                    "widgets",
+                    "EXISTS (SELECT 1 FROM unnest(ftoptions) o WHERE o LIKE 'rowid_column=%')"
+                ),
+                "widgets has no 'id' field so no rowid_column may be guessed"
+            );
+        });
+    }
+
+    // A POST-only path must not produce a table: a plain SELECT on it would
+    // trigger a remote create, and the Operation model cannot send a request
+    // body so a POST-as-search table could not work anyway.
+    #[pg_test]
+    fn openapi_import_skips_post_only_endpoints() {
+        Spi::connect_mut(|c| {
+            import_openapi_schema(c);
+
+            let orders_tables = c
+                .select(
+                    "SELECT count(*) AS n FROM pg_class cl \
+                     JOIN pg_namespace n ON n.oid = cl.relnamespace \
+                     WHERE n.nspname = 'api' AND cl.relname LIKE 'orders%'",
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .filter_map(|r| r.get_by_name::<i64, _>("n").unwrap())
+                .next()
+                .unwrap();
+            assert_eq!(orders_tables, 0, "POST-only /orders must not be imported");
+
+            // Sanity: the GET-backed tables from the same spec were imported,
+            // so a zero above means "POST skipped", not "import did nothing".
+            let imported = c
+                .select(
+                    "SELECT count(*) AS n FROM pg_foreign_table ft \
+                     JOIN pg_class cl ON cl.oid = ft.ftrelid \
+                     JOIN pg_namespace n ON n.oid = cl.relnamespace \
+                     WHERE n.nspname = 'api'",
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .filter_map(|r| r.get_by_name::<i64, _>("n").unwrap())
+                .next()
+                .unwrap();
+            assert_eq!(imported, 2, "expected exactly things + widgets");
+        });
+    }
+
+    // KNOWN GAP -- ignored, not passing. The rowid identifies the remote
+    // resource and lives in the URL, so it is excluded from the request body;
+    // a changed rowid is therefore silently dropped and SHOULD be rejected.
+    //
+    // It is not, and cannot be from a wasm guest: exec_foreign_update in
+    // supabase-wrappers/src/modify.rs strips the rowid column out of new_row
+    // ("remove junk attributes, including rowid attribute") before calling
+    // update(), so openapi_fdw's reject_rowid_reassignment never sees a new
+    // rowid to compare. Observed behaviour today: this UPDATE issues
+    // PATCH /wr_reassign/r-1 -- the OLD id -- and reports success.
+    //
+    // The mock deliberately answers 200 here so this test can distinguish
+    // "rejected by the FDW" from "the API happened to error". Closing the gap
+    // needs a supabase-wrappers core change; un-ignore this test then.
+    #[pg_test]
+    #[ignore = "blocked on supabase-wrappers core: modify.rs strips the rowid from new_row"]
+    fn openapi_write_rejects_rowid_reassignment() {
+        Spi::connect_mut(|c| {
+            create_openapi_write_server(c);
+            c.update(
+                r#"
+                  CREATE FOREIGN TABLE wr_reassign (
+                    id text,
+                    name text
+                  )
+                  SERVER openapi_write_server
+                  OPTIONS (
+                    endpoint '/wr_reassign',
+                    rowid_column 'id',
+                    writable 'true',
+                    update_method 'PATCH'
+                  )
+             "#,
+                None,
+                &[],
+            )
+            .unwrap();
+        });
+
+        let result = std::panic::catch_unwind(|| {
+            Spi::connect_mut(|c| {
+                c.update(
+                    "UPDATE wr_reassign SET id = 'r-2', name = 'x' WHERE id = 'r-1'",
+                    None,
+                    &[],
+                )
+                .is_err()
+            })
+        });
+        assert!(result.is_err());
+    }
+
+    // An UPDATE that leaves the rowid alone still works on the same table --
+    // proves the guard above rejects reassignment specifically, not all UPDATEs.
+    #[pg_test]
+    fn openapi_write_allows_update_without_rowid_change() {
+        Spi::connect_mut(|c| {
+            create_openapi_write_server(c);
+            c.update(
+                r#"
+                  CREATE FOREIGN TABLE wr_items_ok (
+                    id text,
+                    name text,
+                    count bigint,
+                    active boolean
+                  )
+                  SERVER openapi_write_server
+                  OPTIONS (
+                    endpoint '/wr_items',
+                    rowid_column 'id',
+                    writable 'true',
+                    update_method 'PATCH'
+                  )
+             "#,
+                None,
+                &[],
+            )
+            .unwrap();
+
+            c.update(
+                "UPDATE wr_items_ok SET name = 'renamed', count = 7, active = true \
+                 WHERE id = 'i-1'",
+                None,
+                &[],
+            )
+            .unwrap();
+        });
+    }
+
+    // success_status is an allowlist of statuses that mean "written", not a
+    // trust override. A non-2xx entry (e.g. a body-less 302, which would also
+    // bypass the success_path body check) is a misconfiguration.
+    #[pg_test]
+    fn openapi_write_rejects_non_2xx_success_status() {
+        Spi::connect_mut(|c| {
+            create_openapi_write_server(c);
+            c.update(
+                r#"
+                  CREATE FOREIGN TABLE wr_badstatus (
+                    id text,
+                    name text
+                  )
+                  SERVER openapi_write_server
+                  OPTIONS (
+                    endpoint '/wr_items',
+                    rowid_column 'id',
+                    writable 'true',
+                    insert_method 'POST',
+                    success_status '200,302'
+                  )
+             "#,
+                None,
+                &[],
+            )
+            .unwrap();
+        });
+
+        let result = std::panic::catch_unwind(|| {
+            Spi::connect_mut(|c| {
+                c.update("INSERT INTO wr_badstatus (name) VALUES ('x')", None, &[])
+                    .is_err()
+            })
+        });
+        assert!(result.is_err());
+    }
+
+    // When the table shape makes success_path mandatory, the API is expected to
+    // put the per-record outcome in the body. A 2xx that is not 204/205 and
+    // carries no body cannot be verified, so it must fail closed rather than be
+    // reported as a successful write.
+    #[pg_test]
+    fn openapi_write_empty_body_fails_closed() {
+        Spi::connect_mut(|c| {
+            create_openapi_write_server(c);
+            c.update(
+                r#"
+                  CREATE FOREIGN TABLE wr_emptybody (
+                    id text,
+                    name text
+                  )
+                  SERVER openapi_write_server
+                  OPTIONS (
+                    endpoint '/wr_emptybody',
+                    rowid_column 'id',
+                    writable 'true',
+                    insert_method 'POST',
+                    body_root_path '/data',
+                    body_wrap 'array',
+                    success_path '/data/0/code',
+                    success_value 'SUCCESS'
+                  )
+             "#,
+                None,
+                &[],
+            )
+            .unwrap();
+        });
+
+        let result = std::panic::catch_unwind(|| {
+            Spi::connect_mut(|c| {
+                c.update("INSERT INTO wr_emptybody (name) VALUES ('x')", None, &[])
+                    .is_err()
+            })
+        });
+        assert!(result.is_err());
+    }
+
+    // A single business object that merely contains a field named like a
+    // wrapper key must not be unwrapped. 'total' is business-plausible and so
+    // is NOT envelope metadata -- unwrapping to 'items' would discard it.
+    #[pg_test]
+    fn openapi_read_preserves_business_siblings() {
+        Spi::connect_mut(|c| {
+            create_openapi_write_server(c);
+            c.update(
+                r#"
+                  CREATE FOREIGN TABLE biz_siblings (
+                    items jsonb,
+                    total numeric
+                  )
+                  SERVER openapi_write_server
+                  OPTIONS (
+                    endpoint '/biz_siblings'
+                  )
+             "#,
+                None,
+                &[],
+            )
+            .unwrap();
+
+            let totals = c
+                .select("SELECT total FROM biz_siblings", None, &[])
+                .unwrap()
+                .filter_map(|r| r.get_by_name::<pgrx::AnyNumeric, _>("total").unwrap())
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                totals,
+                vec!["99.99"],
+                "sibling 'total' must survive: the response is a business object, not an envelope"
+            );
+        });
+    }
 }

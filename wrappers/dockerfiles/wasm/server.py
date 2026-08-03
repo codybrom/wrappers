@@ -10,6 +10,80 @@ test_table = "table-foo"
 # issues exactly one request per inserted row (read back via GET /wr_count).
 wr_post_count = {"n": 0}
 
+# OpenAPI spec served at /openapi/spec, used by the IMPORT FOREIGN SCHEMA tests.
+# The three paths cover the three table-generation rules -- see the /spec route.
+_THING = {
+    "type": "object",
+    "properties": {
+        "id": {"type": "string"},
+        "name": {"type": "string"},
+        "count": {"type": "integer"},
+    },
+    "required": ["id"],
+}
+
+_WIDGET = {
+    "type": "object",
+    "properties": {
+        # No 'id' property anywhere: the generated table must therefore carry no
+        # rowid_column rather than falling back to the first scalar column.
+        "sku": {"type": "string"},
+        "label": {"type": "string"},
+    },
+}
+
+
+def _envelope(ref):
+    return {
+        "type": "object",
+        "properties": {
+            "data": {"type": "array", "items": {"$ref": ref}},
+            "has_more": {"type": "boolean"},
+        },
+    }
+
+
+def _json_200(ref):
+    return {
+        "responses": {
+            "200": {"content": {"application/json": {"schema": {"$ref": ref}}}}
+        }
+    }
+
+
+IMPORT_SPEC = {
+    "openapi": "3.0.0",
+    "info": {"title": "Import Test API", "version": "1.0.0"},
+    "servers": [{"url": "http://localhost:%d/openapi" % serverPort}],
+    "paths": {
+        "/things": {"get": _json_200("#/components/schemas/ThingList")},
+        "/widgets": {"get": _json_200("#/components/schemas/WidgetList")},
+        # POST-only path: must not produce a table, since a plain SELECT on it
+        # would trigger a remote create.
+        "/orders": {
+            "post": {
+                "responses": {
+                    "201": {
+                        "content": {
+                            "application/json": {
+                                "schema": {"$ref": "#/components/schemas/Thing"}
+                            }
+                        }
+                    }
+                }
+            }
+        },
+    },
+    "components": {
+        "schemas": {
+            "Thing": _THING,
+            "Widget": _WIDGET,
+            "ThingList": _envelope("#/components/schemas/Thing"),
+            "WidgetList": _envelope("#/components/schemas/Widget"),
+        }
+    },
+}
+
 
 # mock API server for WASM FDW testing
 #
@@ -631,6 +705,35 @@ class MockServer(BaseHTTPRequestHandler):
                 body = json.dumps(
                     [{"id": "counter", "posts": wr_post_count["n"]}]
                 )
+            # IMPORT FOREIGN SCHEMA spec. Deliberately shaped to exercise all
+            # three table-generation rules at once:
+            #   /things  -> {data: [Thing]}, Thing has 'id'  -> rowid_column +
+            #               response_path '/data', columns from the RECORD
+            #   /widgets -> {data: [Widget]}, Widget has NO 'id' -> table is
+            #               generated WITHOUT rowid_column (no arbitrary
+            #               fallback to sku/label)
+            #   /orders  -> POST only -> no table generated at all
+            elif req_path == "/spec" or req_path.startswith("/spec?"):
+                body = json.dumps(IMPORT_SPEC)
+            elif req_path == "/things" or req_path.startswith("/things?"):
+                body = json.dumps(
+                    {"data": [{"id": "t-1", "name": "Thing One", "count": 5}]}
+                )
+            elif req_path == "/widgets" or req_path.startswith("/widgets?"):
+                body = json.dumps(
+                    {"data": [{"sku": "w-1", "label": "Widget A"}]}
+                )
+            # A single business object that merely contains a field named like
+            # a wrapper key, alongside a business-plausible 'total'. Must NOT be
+            # unwrapped to 'items' -- doing so would discard 'total'.
+            elif req_path == "/biz_siblings" or req_path.startswith("/biz_siblings?"):
+                body = json.dumps({"items": {"sku": "A1", "qty": 2}, "total": 99.99})
+            # Scan source for the rowid-reassignment UPDATE test.
+            elif req_path == "/wr_reassign" or req_path.startswith("/wr_reassign?"):
+                body = json.dumps([{"id": "r-1", "name": "old"}])
+            elif req_path.startswith("/wr_reassign/"):
+                rec_id = req_path.split("/")[2].split("?")[0]
+                body = json.dumps({"id": rec_id, "name": "old"})
             else:
                 self.send_response(404)
                 return
@@ -919,6 +1022,15 @@ class MockServer(BaseHTTPRequestHandler):
                 self.respond(200, {"code": "FAILED", "message": "record rejected"})
             elif base == "/wr_multistatus":
                 self.respond(207, {"data": [{"code": "SUCCESS"}, {"code": "FAILED"}]})
+            elif base == "/wr_emptybody":
+                # A 2xx that is NOT 204/205 but carries no body at all. On a
+                # table whose shape makes success_path mandatory, the per-record
+                # outcome was supposed to be in that body -- so this cannot be
+                # verified and must fail closed rather than report success.
+                self.send_response(200)
+                self.send_header("Content-type", "application/json")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
             else:
                 self.send_response(404)
                 self.end_headers()
@@ -933,6 +1045,15 @@ class MockServer(BaseHTTPRequestHandler):
 
     def do_PATCH(self):
         (fdw, req_path) = self.get_fdw_req_path()
+
+        if fdw == "openapi" and req_path.startswith("/wr_reassign/"):
+            # Deliberately answers 200 SUCCESS. This endpoint is reached only if
+            # the FDW failed to reject a rowid reassignment, and the test asserts
+            # the statement errors -- so a happy response here is what makes the
+            # test meaningful. Answering 4xx/5xx instead would make the statement
+            # error either way and the test would pass without proving anything.
+            self.respond(200, {"ok": True})
+            return
 
         if fdw == "openapi" and req_path.startswith("/wr_items/"):
             # Validate what a type-faithful FDW UPDATE must send: rowid in the

@@ -195,6 +195,23 @@ pub(crate) fn qual_allows_limit_pushdown(
 /// row's new values; `rowid_str` is the old rowid identifying the remote
 /// resource. The rowid lives in the URL and is excluded from the body, so a
 /// reassignment would be silently dropped — surface it as an error instead.
+///
+/// **Currently unreachable from a wasm guest, by host design.** The framework
+/// strips the rowid column out of `new_row` before calling `update()` — see
+/// `exec_foreign_update` in `supabase-wrappers/src/modify.rs`:
+///
+/// ```text
+/// // remove junk attributes, including rowid attribute, from the new row
+/// new_row.retain(|(col, _)| is_ft_col && state.rowid_name != col.as_str());
+/// ```
+///
+/// so `params` never contains the rowid and this always returns `Ok(())`.
+/// Verified end-to-end: `UPDATE ... SET id = 'r-2' WHERE id = 'r-1'` issues
+/// `PATCH /wr_reassign/r-1` (the OLD id) and reports success — the silent drop
+/// this was meant to prevent still happens. Closing it requires preserving the
+/// new rowid for the guest, which is a `supabase-wrappers` core change. The
+/// check is kept so it takes effect the moment that lands; the ignored pg_test
+/// `openapi_write_rejects_rowid_reassignment` is the ready regression test.
 pub(crate) fn reject_rowid_reassignment(
     params: &HashMap<String, String>,
     rowid_column: &str,
