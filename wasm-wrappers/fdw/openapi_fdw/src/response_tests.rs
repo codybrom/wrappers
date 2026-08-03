@@ -166,6 +166,123 @@ fn test_extract_data_single_object_fallback() {
 }
 
 #[test]
+fn test_extract_data_object_wrapper_with_business_siblings_not_unwrapped() {
+    // A single business object that merely contains a field literally named like
+    // a wrapper key ('data') must NOT be unwrapped — doing so would discard the
+    // sibling id/name fields.
+    let fdw = fdw_with_response_path(None);
+    let mut resp = serde_json::json!({
+        "id": "u1",
+        "name": "Alice",
+        "data": {"x": 1}
+    });
+    let rows = fdw.extract_data(&mut resp).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["id"], "u1");
+    assert_eq!(rows[0]["name"], "Alice");
+}
+
+#[test]
+fn test_extract_data_pure_object_envelope_is_unwrapped() {
+    // An object wrapper is unwrapped when the response is a pure envelope
+    // (only the wrapper key plus known metadata siblings).
+    let fdw = fdw_with_response_path(None);
+    let mut resp = serde_json::json!({
+        "data": {"id": "r1", "value": 42},
+        "has_more": false
+    });
+    let rows = fdw.extract_data(&mut resp).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["id"], "r1");
+    assert_eq!(rows[0]["value"], 42);
+}
+
+#[test]
+fn test_extract_data_object_wrapper_with_ambiguous_total_not_unwrapped() {
+    // 'total' is a plausible business field, so it is NOT an envelope metadata
+    // key. An order {items: {...}, total: 99.99} must stay whole rather than be
+    // unwrapped to its items — unwrapping would silently discard the total.
+    let fdw = fdw_with_response_path(None);
+    let mut resp = serde_json::json!({
+        "items": {"sku": "A1", "qty": 2},
+        "total": 99.99
+    });
+    let rows = fdw.extract_data(&mut resp).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["total"], 99.99);
+    assert_eq!(rows[0]["items"]["sku"], "A1");
+}
+
+#[test]
+fn test_extract_data_object_wrapper_with_business_count_and_url_not_unwrapped() {
+    // Same for the other bare keys dropped from ENVELOPE_META_KEYS.
+    for sibling in ["count", "size", "url", "object", "self", "kind"] {
+        let fdw = fdw_with_response_path(None);
+        let mut resp = serde_json::json!({
+            "data": {"id": "r1"},
+            sibling: "business-value"
+        });
+        let rows = fdw.extract_data(&mut resp).unwrap();
+        assert_eq!(rows.len(), 1, "sibling '{sibling}' should block unwrapping");
+        assert_eq!(
+            rows[0][sibling], "business-value",
+            "sibling '{sibling}' must be preserved"
+        );
+    }
+}
+
+#[test]
+fn test_extract_data_pure_envelope_unambiguous_meta_keys_still_unwrap() {
+    // The unambiguous compound/pagination keys remain envelope metadata, so a
+    // genuine single-object envelope is still unwrapped.
+    for sibling in ["total_count", "page_size", "next_cursor", "_links"] {
+        let fdw = fdw_with_response_path(None);
+        let mut resp = serde_json::json!({
+            "data": {"id": "r1", "value": 42},
+            sibling: 1
+        });
+        let rows = fdw.extract_data(&mut resp).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0]["id"], "r1",
+            "sibling '{sibling}' should still allow unwrapping"
+        );
+    }
+}
+
+#[test]
+fn test_extract_data_stripe_style_list_envelope_unaffected_by_meta_trim() {
+    // Stripe's list envelope carries 'object' and 'url' siblings, which are no
+    // longer envelope metadata — but 'data' is ARRAY-valued, and array wrappers
+    // are matched unconditionally before the pure-envelope check, so the list
+    // still unwraps.
+    let fdw = fdw_with_response_path(None);
+    let mut resp = serde_json::json!({
+        "object": "list",
+        "url": "/v1/charges",
+        "has_more": false,
+        "data": [{"id": "ch_1"}, {"id": "ch_2"}]
+    });
+    let rows = fdw.extract_data(&mut resp).unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["id"], "ch_1");
+}
+
+#[test]
+fn test_extract_data_array_wrapper_preferred_over_object_wrapper() {
+    // An array-valued wrapper key wins over an object-valued one, regardless of
+    // WRAPPER_KEYS order (here 'data' is an object, 'results' is the array).
+    let fdw = fdw_with_response_path(None);
+    let mut resp = serde_json::json!({
+        "data": {"meta": "ignored"},
+        "results": [{"id": 1}, {"id": 2}]
+    });
+    let rows = fdw.extract_data(&mut resp).unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["id"], 1);
+}
+
+#[test]
 fn test_extract_data_ownership_no_clone() {
     // Verify that extract_data takes ownership rather than cloning:
     // after extraction, the original data should be replaced with null

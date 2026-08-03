@@ -3,13 +3,62 @@
 use serde_json::Value as JsonValue;
 
 use crate::OpenApiFdw;
-use crate::bindings::supabase::wrappers::types::FdwError;
+use crate::bindings::supabase::wrappers::{types::FdwError, utils};
 use crate::pagination::PaginationToken;
 
 /// Common wrapper keys for auto-detecting the data array in API responses.
 pub(crate) const WRAPPER_KEYS: &[&str] = &[
     "data", "results", "items", "records", "entries", "features", "@graph",
 ];
+
+/// Metadata/pagination keys that may accompany an object-valued wrapper in a
+/// pure-envelope response without making the response a business object.
+///
+/// Deliberately conservative: every entry must be implausible as a *business*
+/// field on a record, because a false positive here silently discards real
+/// data. Bare `total`, `count`, `size`, `url`, `object`, `self` and `kind` are
+/// excluded for exactly that reason — an order `{items: {...}, total: 99.99}`
+/// must not be mistaken for an envelope around `items`. Their unambiguous
+/// compound forms are listed instead. Omitting a genuine metadata key only
+/// means the response is left unwrapped, which the user can correct with an
+/// explicit `response_path`; including a business key silently drops columns.
+///
+/// This list governs OBJECT-valued wrappers only. Array-valued wrappers — the
+/// common list envelope, e.g. Stripe's `{object: "list", data: [...], url: …}`
+/// — are matched earlier and unconditionally, so they are unaffected.
+const ENVELOPE_META_KEYS: &[&str] = &[
+    "has_more",
+    "meta",
+    "metadata",
+    "pagination",
+    "links",
+    "_links",
+    "next",
+    "next_url",
+    "previous",
+    "prev",
+    "cursor",
+    "next_cursor",
+    "total_count",
+    "total_pages",
+    "page",
+    "per_page",
+    "page_size",
+    "offset",
+    "limit",
+];
+
+/// Returns true if `obj` is a pure envelope around `wrapper_key`: every other
+/// top-level key is a known metadata/pagination key, so unwrapping the wrapper
+/// won't discard sibling business data.
+fn is_pure_envelope(obj: &JsonValue, wrapper_key: &str) -> bool {
+    obj.as_object().is_some_and(|map| {
+        map.keys().all(|k| {
+            k.as_str() == wrapper_key
+                || ENVELOPE_META_KEYS.iter().any(|m| m.eq_ignore_ascii_case(k))
+        })
+    })
+}
 
 /// JSON pointer paths to check for a next-page URL.
 const NEXT_URL_PATHS: &[&str] = &[
@@ -47,8 +96,16 @@ impl OpenApiFdw {
             if let Some(data) = resp.pointer_mut(path).map(JsonValue::take) {
                 return Self::json_to_rows(data);
             }
-            // response_path not found — fall through to auto-detection
-            // (common when rowid lookup returns single object instead of collection)
+            // response_path not found — fall through to auto-detection (common
+            // when a rowid lookup returns a single object instead of the
+            // collection). Warn in debug so a genuinely mistyped response_path is
+            // diagnosable rather than silently ignored.
+            if self.config.debug {
+                utils::report_info(&format!(
+                    "[openapi_fdw] response_path '{path}' not found in response; \
+                     falling back to auto-detection."
+                ));
+            }
         }
 
         // Direct array response
@@ -58,11 +115,21 @@ impl OpenApiFdw {
 
         // Try common wrapper patterns
         if resp.is_object() {
+            // Prefer an array-valued wrapper key — the unambiguous list-envelope
+            // case (e.g. {data: [...]}).
             for key in WRAPPER_KEYS {
-                if resp
-                    .get(*key)
-                    .is_some_and(|d| d.is_array() || d.is_object())
-                {
+                if resp.get(*key).is_some_and(JsonValue::is_array) {
+                    return Self::json_to_rows(resp[*key].take());
+                }
+            }
+
+            // An object-valued wrapper key is the record holder only when the
+            // response is a pure envelope (every sibling is known metadata).
+            // Otherwise the response is itself a single business object that
+            // merely contains a field named like a wrapper key (e.g.
+            // {id, name, data:{...}}), and unwrapping would discard the siblings.
+            for key in WRAPPER_KEYS {
+                if resp.get(*key).is_some_and(JsonValue::is_object) && is_pure_envelope(resp, key) {
                     return Self::json_to_rows(resp[*key].take());
                 }
             }

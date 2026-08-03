@@ -140,6 +140,16 @@ fn test_cell_to_json_other_is_clean_error() {
     assert!(err.contains("not supported"));
 }
 
+#[test]
+fn test_cell_to_json_date_overflow_is_error() {
+    // The load-bearing checked_mul(1_000_000) guard: a date whose seconds * 1e6
+    // overflows i64 must produce a clean error (before the host time helper is
+    // ever called), not a panic/wrap.
+    let err = cell_to_json(&Cell::Date(i64::MAX), "created_on").unwrap_err();
+    assert!(err.contains("created_on"));
+    assert!(err.contains("out of range"));
+}
+
 // ---------- cell_to_string ----------
 
 #[test]
@@ -394,6 +404,23 @@ fn test_parse_success_status_empty_errors() {
 }
 
 #[test]
+fn test_parse_success_status_rejects_non_2xx() {
+    // A successful write must return a 2xx; a non-2xx entry (often body-less and
+    // able to bypass the success_path check) is a misconfiguration.
+    for v in ["302", "200,302", "404", "500", "199"] {
+        assert!(
+            parse_success_status(v).is_err(),
+            "success_status '{v}' with a non-2xx code must be rejected"
+        );
+    }
+    // 2xx-only lists still parse.
+    assert_eq!(
+        parse_success_status("200,201,202,204").unwrap(),
+        vec![200, 201, 202, 204]
+    );
+}
+
+#[test]
 fn test_validate_json_pointer() {
     assert!(validate_json_pointer("/data", "p").is_ok());
     assert!(validate_json_pointer("/data/0/code", "p").is_ok());
@@ -426,12 +453,27 @@ fn test_config_writable_true_and_one() {
 
 #[test]
 fn test_config_writable_garbage_disabled() {
-    for v in ["false", "0", "yes", "TRUE"] {
+    // Explicit false-ish values and genuine garbage leave the table read-only.
+    for v in ["false", "0", "no", "off", "banana", ""] {
         assert!(
             !config_from(&[("writable", v)], "/items", "id")
                 .unwrap()
                 .writable,
             "writable '{v}' must not enable writes"
+        );
+    }
+}
+
+#[test]
+fn test_config_writable_case_insensitive_aliases() {
+    // The gate is case-insensitive and accepts true/1/yes/on, so `writable
+    // 'TRUE'` is not silently read as read-only (was a real footgun).
+    for v in ["true", "TRUE", "True", "1", "yes", "YES", "on"] {
+        assert!(
+            config_from(&[("writable", v)], "/items", "id")
+                .unwrap()
+                .writable,
+            "writable '{v}' must enable writes"
         );
     }
 }
@@ -784,6 +826,32 @@ fn test_build_write_url_no_double_placement_query_when_template_has_rowid() {
 }
 
 #[test]
+fn test_build_write_url_reports_rowid_consumed_for_body_location_template() {
+    // With a Body rowid location AND an endpoint template that consumes {id},
+    // build_write_url still substitutes the rowid into the path and reports it
+    // in `consumed`. The update/delete hooks rely on `consumed` to skip
+    // re-placing the rowid in the JSON body, so it isn't sent in both places.
+    let fdw = fdw_with_base_url("https://api.example.com");
+    let mut params = HashMap::new();
+    params.insert("id".to_string(), "i-1".to_string());
+    let (url, consumed) = fdw
+        .build_write_url(
+            "/records/{id}",
+            &params,
+            Some("i-1"),
+            RowidLocation::Body,
+            "id",
+            "id",
+        )
+        .unwrap();
+    assert_eq!(url, "https://api.example.com/records/i-1");
+    assert!(
+        consumed.contains(&"id".to_string()),
+        "rowid must be reported consumed so the body hook can skip it: {consumed:?}"
+    );
+}
+
+#[test]
 fn test_build_write_url_appends_api_key_query() {
     let mut fdw = fdw_with_base_url("https://api.example.com");
     fdw.config.api_key_query = Some(("api_key".to_string(), "sk_test".to_string()));
@@ -962,6 +1030,101 @@ fn test_check_response_no_success_path_skips_body_parse() {
     let cfg = writable_config();
     assert!(check_response(204, "", &cfg, "/items", true).is_ok());
     assert!(check_response(200, "not json", &cfg, "/items", true).is_ok());
+}
+
+/// A writable envelope config: body_root_path set forces success_path, and the
+/// API is expected to encode the per-record outcome in the response body.
+fn envelope_config() -> WriteConfig {
+    config_from(
+        &[
+            ("writable", "true"),
+            ("insert_method", "POST"),
+            ("body_root_path", "/data"),
+            ("success_path", "/data/status"),
+        ],
+        "/items",
+        "id",
+    )
+    .unwrap()
+}
+
+#[test]
+fn test_check_response_envelope_empty_body_fails_closed() {
+    // For an envelope table the API encodes the outcome in the body, so an empty
+    // 2xx body cannot be verified — fail closed rather than silently reporting a
+    // possibly-failed write as success.
+    let cfg = envelope_config();
+    let err = check_response(200, "", &cfg, "/items", true).unwrap_err();
+    assert!(err.contains("empty body"));
+    let err = check_response(202, "   ", &cfg, "/items", true).unwrap_err();
+    assert!(err.contains("empty body"));
+}
+
+#[test]
+fn test_check_response_envelope_no_content_status_ok() {
+    // A genuine no-content 2xx status (204/205) legitimately has no body, even
+    // for an envelope table, so it is not treated as a failure. (Non-2xx like
+    // 304 is already rejected by the status gate.)
+    let cfg = envelope_config();
+    assert!(check_response(204, "", &cfg, "/items", true).is_ok());
+    assert!(check_response(205, "   ", &cfg, "/items", true).is_ok());
+}
+
+#[test]
+fn test_check_response_unusual_status_empty_body_fails_closed() {
+    // A flat (non-envelope) async API whose success_path is mandatory because of
+    // an unusual success_status (202): an empty 202 body carries no outcome and
+    // cannot be verified, so fail closed. Regression for the gap where the
+    // empty-body guard only fired when body_root_path was set.
+    let cfg = config_from(
+        &[
+            ("writable", "true"),
+            ("update_method", "PATCH"),
+            ("success_status", "202"),
+            ("success_path", "/status"),
+        ],
+        "/items",
+        "id",
+    )
+    .unwrap();
+    let err = check_response(202, "", &cfg, "/items", true).unwrap_err();
+    assert!(err.contains("empty body"));
+}
+
+#[test]
+fn test_check_response_trivial_status_empty_body_ok() {
+    // Control: when success_path is set on a trivial-status table (no envelope,
+    // only 200/201/204), an empty 2xx body is NOT forced to fail — the fix must
+    // not over-reach beyond the shapes that mandate a body outcome.
+    let cfg = config_from(
+        &[
+            ("writable", "true"),
+            ("insert_method", "POST"),
+            ("success_status", "200,201,204"),
+            ("success_path", "/status"),
+        ],
+        "/items",
+        "id",
+    )
+    .unwrap();
+    assert!(check_response(200, "", &cfg, "/items", true).is_ok());
+}
+
+#[test]
+fn test_check_response_envelope_valid_body_still_checked() {
+    // Non-empty envelope bodies are still verified against success_path.
+    let cfg = envelope_config();
+    assert!(
+        check_response(
+            200,
+            r#"{"data":{"status":"SUCCESS"}}"#,
+            &cfg,
+            "/items",
+            true
+        )
+        .is_ok()
+    );
+    assert!(check_response(200, r#"{"data":{"status":"FAILED"}}"#, &cfg, "/items", true).is_err());
 }
 
 // ---------- check_response: leak safety ----------

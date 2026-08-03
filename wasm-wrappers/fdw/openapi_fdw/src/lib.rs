@@ -147,9 +147,69 @@ fn parse_usize_option(value: &str, field_name: &str) -> Result<usize, String> {
         .map_err(|_| format!("Invalid value for '{field_name}': '{value}'"))
 }
 
-/// Parse an optional string as a boolean flag ("true" or "1" means true).
-fn parse_bool_flag(value: Option<&str>) -> bool {
-    value.is_some_and(|v| v == "true" || v == "1")
+/// Parse an optional string as a boolean flag, defaulting to `false`.
+///
+/// Case-insensitive; accepts `true/1/yes/on` as true. Used for every opt-in
+/// flag (debug, writable, ...) so `writable 'TRUE'` is not silently read as
+/// false.
+pub(crate) fn parse_bool_flag(value: Option<&str>) -> bool {
+    value.is_some_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "true" | "1" | "yes" | "on"
+        )
+    })
+}
+
+/// Parse an optional string as a boolean flag that defaults to `true`.
+///
+/// Case-insensitive; only an explicit false-ish value (`false/0/no/off`)
+/// disables it. Used for opt-out flags like `include_attrs`.
+pub(crate) fn parse_bool_flag_default_true(value: Option<&str>) -> bool {
+    !value.is_some_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "false" | "0" | "no" | "off"
+        )
+    })
+}
+
+/// Whether a single qual can be honored remotely for LIMIT pushdown. A qual is
+/// honored remotely only when it is a non-OR equality ('=') AND its value is
+/// actually serialized to the API and re-injected into returned rows so
+/// Postgres's local re-check passes — that is exactly the set that
+/// `qual_value_to_string` accepts (String / integer / float / bool / uuid).
+/// A '=' qual whose value cannot be stringified (numeric, date, timestamp,
+/// json, arrays) is NOT pushed or injected, so Postgres filters it locally and
+/// drops source rows; an early source-side LIMIT would then under-return.
+/// `value_pushable` must therefore reflect `qual_value_to_string(q).is_some()`.
+pub(crate) fn qual_allows_limit_pushdown(
+    operator: &str,
+    use_or: bool,
+    value_pushable: bool,
+) -> bool {
+    operator == "=" && !use_or && value_pushable
+}
+
+/// Reject an UPDATE that changes the rowid column's value. `params` holds the
+/// row's new values; `rowid_str` is the old rowid identifying the remote
+/// resource. The rowid lives in the URL and is excluded from the body, so a
+/// reassignment would be silently dropped — surface it as an error instead.
+pub(crate) fn reject_rowid_reassignment(
+    params: &HashMap<String, String>,
+    rowid_column: &str,
+    rowid_str: &str,
+) -> Result<(), String> {
+    if let Some(new_rowid) = params.get(rowid_column)
+        && new_rowid != rowid_str
+    {
+        return Err(format!(
+            "changing the rowid column '{rowid_column}' in UPDATE is not supported \
+             (old '{rowid_str}', new '{new_rowid}'): it identifies the remote resource and \
+             cannot be reassigned."
+        ));
+    }
+    Ok(())
 }
 
 /// Check whether the consumed row count has reached or exceeded the limit.
@@ -188,6 +248,31 @@ impl OpenApiFdw {
             &mut (*INSTANCE)
         }
     }
+
+    /// Ensure `base_url` is populated before a scan or write.
+    ///
+    /// When only `spec_url`/`spec_json` is configured (a documented setup),
+    /// `base_url` is derived from the spec's `servers`. Unlike
+    /// `import_foreign_schema`, the scan/write lifecycle otherwise never fetches
+    /// the spec, leaving `base_url` empty and producing scheme-less request URLs.
+    /// Skips the network round-trip when the spec is already parsed.
+    fn ensure_base_url(&mut self) -> Result<(), FdwError> {
+        if !self.config.base_url.is_empty() {
+            return Ok(());
+        }
+        if self.config.spec_url.is_none() && self.config.spec_json.is_none() {
+            return Ok(());
+        }
+        if self.spec.is_none() {
+            // fetch_spec derives base_url from the spec's servers when unset.
+            self.fetch_spec()?;
+        } else if let Some(url) = self.spec.as_ref().and_then(OpenApiSpec::base_url) {
+            let url = url.trim_end_matches('/').to_string();
+            validate_url(&url, "base_url (from spec servers)")?;
+            self.config.base_url = url;
+        }
+        Ok(())
+    }
 }
 
 impl Guest for OpenApiFdw {
@@ -222,11 +307,10 @@ impl Guest for OpenApiFdw {
             return Err("Cannot use both spec_url and spec_json. Choose one.".to_string());
         }
 
-        // Whether to include an 'attrs' jsonb column in IMPORT FOREIGN SCHEMA output
-        // Default is true; only "false" or "0" explicitly disables it
-        this.config.include_attrs = !opts
-            .get("include_attrs")
-            .is_some_and(|v| v == "false" || v == "0");
+        // Whether to include an 'attrs' jsonb column in IMPORT FOREIGN SCHEMA output.
+        // Default is true; only an explicit false-ish value disables it.
+        this.config.include_attrs =
+            parse_bool_flag_default_true(opts.get("include_attrs").as_deref());
 
         // Validate spec_url format if provided
         if let Some(ref spec_url) = this.config.spec_url {
@@ -316,9 +400,29 @@ impl Guest for OpenApiFdw {
         this.pagination.reset();
         this.injected_params.clear();
 
-        // Capture limit for early pagination stop
-        // Note: Postgres handles offset locally, so we need offset + count total rows
-        this.src_limit = ctx.get_limit().map(|v| v.offset() + v.count());
+        // Capture LIMIT for early pagination stop — but ONLY when every qual can
+        // be honored remotely. A qual is honored remotely only if it is pushed
+        // to the API AND re-injected into returned rows (so Postgres's local
+        // re-check keeps every source row); build_query_params does that exactly
+        // when qual_value_to_string is Some. Any other operator, an OR'd qual, or
+        // a '=' whose value can't be stringified (numeric/date/timestamp/json) is
+        // filtered locally and drops source rows, so early-stopping at
+        // offset+count *source* rows would under-return. In those cases leave
+        // src_limit None and let Postgres's Limit node terminate the scan.
+        // saturating_add guards the i64 sum.
+        let limit_pushdown_safe = ctx.get_quals().iter().all(|q| {
+            qual_allows_limit_pushdown(
+                &q.operator(),
+                q.use_or(),
+                Self::qual_value_to_string(q).is_some(),
+            )
+        });
+        this.src_limit = if limit_pushdown_safe {
+            ctx.get_limit()
+                .map(|v| v.offset().saturating_add(v.count()))
+        } else {
+            None
+        };
         this.consumed_row_cnt = 0;
 
         // Cache column metadata once to avoid WASM boundary crossings in iter_scan
@@ -343,6 +447,10 @@ impl Guest for OpenApiFdw {
         if this.config.debug {
             this.scan_row_count = 0;
         }
+
+        // Resolve base_url from the spec if only spec_url/spec_json was given,
+        // otherwise request URLs would be scheme-less at scan time.
+        this.ensure_base_url()?;
 
         // Make initial request
         this.make_request(ctx)?;
@@ -415,6 +523,11 @@ impl Guest for OpenApiFdw {
         this.pagination.reset();
         this.consumed_row_cnt = 0;
         this.injected_params.clear();
+        // Reset the debug row counter too, so a nested-loop re-scan doesn't
+        // report a cumulative "Scan complete: N rows" count in end_scan.
+        if this.config.debug {
+            this.scan_row_count = 0;
+        }
         this.make_request(ctx)?;
         this.pagination.record_first_page();
         Ok(())
@@ -462,16 +575,24 @@ impl Guest for OpenApiFdw {
             );
         }
         this.write = Some(cfg);
+
+        // Resolve base_url from the spec's servers here too, not just in
+        // begin_scan: a spec-only server (base_url advertised as optional when
+        // spec_url/spec_json provides servers) that is written to before any
+        // scan would otherwise build a scheme-less write URL. Runs after write
+        // validation so a misconfigured or read-only table still fails first.
+        this.ensure_base_url()?;
         Ok(())
     }
 
     fn insert(_ctx: &Context, row: &Row) -> FdwResult {
         let this = Self::this_mut();
+        // Borrow the write config rather than cloning it per row: every
+        // downstream call takes &self / &WriteConfig.
         let cfg = this
             .write
             .as_ref()
-            .ok_or("write configuration is not initialized")?
-            .clone();
+            .ok_or("write configuration is not initialized")?;
         let method = cfg.insert_method.ok_or(
             "INSERT is not enabled for this foreign table. \
              Set the insert_method table option to enable it.",
@@ -503,16 +624,16 @@ impl Guest for OpenApiFdw {
             .split('?')
             .next()
             .unwrap_or(&cfg.insert_endpoint);
-        this.execute_write(method, url, body, &cfg, safe_endpoint)
+        this.execute_write(method, url, body, cfg, safe_endpoint)
     }
 
     fn update(_ctx: &Context, rowid: Cell, row: &Row) -> FdwResult {
         let this = Self::this_mut();
+        // Borrow (not clone) the write config; downstream calls take &self.
         let cfg = this
             .write
             .as_ref()
-            .ok_or("write configuration is not initialized")?
-            .clone();
+            .ok_or("write configuration is not initialized")?;
         let method = cfg.update_method.ok_or(
             "UPDATE is not enabled for this foreign table. \
              Set the update_method table option to enable it.",
@@ -524,6 +645,9 @@ impl Guest for OpenApiFdw {
         let cells = row.cells();
 
         let mut params = write::row_param_map(&cols, &cells);
+        // Reject an attempt to change the rowid itself: row_param_map carries the
+        // row's new value for the rowid column, while `rowid_str` is the old one.
+        reject_rowid_reassignment(&params, &cfg.rowid_column, &rowid_str)?;
         params.insert(cfg.rowid_column.clone(), rowid_str.clone());
         let (url, consumed) = this.build_write_url(
             &cfg.update_endpoint,
@@ -538,7 +662,21 @@ impl Guest for OpenApiFdw {
         // column is always excluded from the generic body to avoid
         // double-emitting it.
         let mut body_map = write::build_body(&cols, &cells, Some(&cfg.rowid_column), &consumed)?;
-        if cfg.update_rowid_location == RowidLocation::Body {
+        // Only place the rowid in the body when the URL template did not already
+        // consume it as a {param} (mirrors build_write_url's Url/Query guards);
+        // otherwise it would land in both the path and the body.
+        if cfg.update_rowid_location == RowidLocation::Body && !consumed.contains(&cfg.rowid_column)
+        {
+            // Refuse to overwrite a distinct real column sharing rowid_body_key's
+            // name. build_body already excludes rowid_column, so the default key
+            // (== rowid_column) never collides; only a custom key can.
+            if body_map.contains_key(&cfg.rowid_body_key) {
+                return Err(format!(
+                    "rowid_body_key '{}' collides with a column of the same name in \
+                     the write body; choose a distinct rowid_body_key.",
+                    cfg.rowid_body_key
+                ));
+            }
             body_map.insert(
                 cfg.rowid_body_key.clone(),
                 write::cell_to_json(&rowid, &cfg.rowid_column)?,
@@ -552,16 +690,16 @@ impl Guest for OpenApiFdw {
             .split('?')
             .next()
             .unwrap_or(&cfg.update_endpoint);
-        this.execute_write(method, url, body, &cfg, safe_endpoint)
+        this.execute_write(method, url, body, cfg, safe_endpoint)
     }
 
     fn delete(_ctx: &Context, rowid: Cell) -> FdwResult {
         let this = Self::this_mut();
+        // Borrow (not clone) the write config; downstream calls take &self.
         let cfg = this
             .write
             .as_ref()
-            .ok_or("write configuration is not initialized")?
-            .clone();
+            .ok_or("write configuration is not initialized")?;
         let method = cfg.delete_method.ok_or(
             "DELETE is not enabled for this foreign table. \
              Set the delete_method table option to enable it.",
@@ -573,7 +711,7 @@ impl Guest for OpenApiFdw {
         // endpoint template fails with the missing-parameter error.
         let mut params = HashMap::with_capacity(1);
         params.insert(cfg.rowid_column.clone(), rowid_str.clone());
-        let (url, _consumed) = this.build_write_url(
+        let (url, consumed) = this.build_write_url(
             &cfg.delete_endpoint,
             &params,
             Some(&rowid_str),
@@ -583,8 +721,11 @@ impl Guest for OpenApiFdw {
         )?;
 
         // No body unless the rowid itself is body-placed (e.g. a POST-based
-        // soft delete with an enveloped id).
-        let body = if cfg.delete_rowid_location == RowidLocation::Body {
+        // soft delete with an enveloped id) AND the URL template didn't already
+        // consume it as a {param} (avoid double-placing it in path and body).
+        let body = if cfg.delete_rowid_location == RowidLocation::Body
+            && !consumed.contains(&cfg.rowid_column)
+        {
             let mut body_map = serde_json::Map::new();
             body_map.insert(
                 cfg.rowid_body_key.clone(),
@@ -600,7 +741,7 @@ impl Guest for OpenApiFdw {
             .split('?')
             .next()
             .unwrap_or(&cfg.delete_endpoint);
-        this.execute_write(method, url, body, &cfg, safe_endpoint)
+        this.execute_write(method, url, body, cfg, safe_endpoint)
     }
 
     fn end_modify(_ctx: &Context) -> FdwResult {

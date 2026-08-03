@@ -163,7 +163,26 @@ pub(crate) fn parse_success_status(value: &str) -> Result<Vec<u16>, String> {
             "{OPT_SUCCESS_STATUS} is set but contains no status codes"
         ));
     }
+    // A successful write must return a 2xx. A non-2xx entry (e.g. a 302, which
+    // is typically body-less and would also bypass the success_path check) is a
+    // misconfiguration, not a trust override — reject it.
+    if let Some(&bad) = codes.iter().find(|&&c| !(200..=299).contains(&c)) {
+        return Err(format!(
+            "Invalid HTTP status code '{bad}' in {OPT_SUCCESS_STATUS}: a successful \
+             write must return a 2xx status."
+        ));
+    }
     Ok(codes)
+}
+
+/// Whether a `success_status` allowlist contains a code that status alone can't
+/// certify as a successful write — anything outside the trivially-successful
+/// 200/201/204. Such an API is expected to encode the per-record outcome in the
+/// response body, so success_path is mandatory (config time) AND an empty body
+/// cannot be trusted as success (response time). Single source of truth for both
+/// checks so they can't drift.
+pub(crate) fn success_status_is_unusual(success_status: Option<&[u16]>) -> bool {
+    success_status.is_some_and(|codes| codes.iter().any(|c| !matches!(c, 200 | 201 | 204)))
 }
 
 /// Validate that a `_path` option is a JSON pointer: starts with '/' and has
@@ -287,17 +306,15 @@ pub(crate) fn build_write_config(
     // success_path so the silent-corruption hole stays closed by construction.
     // (Options are table-level, so a single success_path covers every write
     // operation on the table.)
-    if writable && success_path.is_none() {
-        let has_unusual_status = success_status
-            .as_ref()
-            .is_some_and(|codes| codes.iter().any(|c| !matches!(c, 200 | 201 | 204)));
-        if has_unusual_status || body_root_path.is_some() {
-            return Err(format!(
-                "{OPT_SUCCESS_PATH} is required for this table: the API may signal \
-                 per-record failure inside a 2xx response body. Set {OPT_SUCCESS_PATH} \
-                 (and optionally {OPT_SUCCESS_VALUE}) so failed writes raise an error."
-            ));
-        }
+    if writable
+        && success_path.is_none()
+        && (success_status_is_unusual(success_status.as_deref()) || body_root_path.is_some())
+    {
+        return Err(format!(
+            "{OPT_SUCCESS_PATH} is required for this table: the API may signal \
+             per-record failure inside a 2xx response body. Set {OPT_SUCCESS_PATH} \
+             (and optionally {OPT_SUCCESS_VALUE}) so failed writes raise an error."
+        ));
     }
 
     Ok(WriteConfig {
@@ -505,15 +522,34 @@ pub(crate) fn check_response(
         ));
     }
 
-    // A success_path check only applies when there is a body to inspect. An
-    // empty response (e.g. 204 No Content, common on DELETE) carries no
-    // per-record failure signal, so the status gate above is the only check
-    // that can apply — otherwise an empty-body DELETE on an envelope table
-    // (where success_path is mandatory) would always fail JSON parsing.
-    if let Some(ref path) = cfg.success_path
-        && !body.trim().is_empty()
-    {
-        let parsed: JsonValue = serde_json::from_str(body).map_err(|_| {
+    // A success_path check needs a body to inspect. A genuinely body-less
+    // response (204/205/304) carries no per-record failure signal, so the
+    // status gate above is the only check that can apply.
+    //
+    // But when success_path was made mandatory because the table shape signals a
+    // body-encoded outcome — an envelope (body_root_path) OR an unusual
+    // success_status like 202 — the API is expected to put the per-record result
+    // in the body. An empty (non-204/205) 2xx body from such a table cannot be
+    // verified, so fail closed rather than silently reporting a possibly-failed
+    // write as success.
+    if let Some(ref path) = cfg.success_path {
+        let body_trimmed = body.trim();
+        if body_trimmed.is_empty() {
+            // 204/205 are the body-less 2xx statuses and are always allowed
+            // empty; any other 2xx with an empty body where a body outcome was
+            // required can't be verified.
+            let requires_body_outcome = cfg.body_root_path.is_some()
+                || success_status_is_unusual(cfg.success_status.as_deref());
+            if requires_body_outcome && !matches!(status_code, 204 | 205) {
+                return Err(format!(
+                    "write to API endpoint ({safe_endpoint}) returned HTTP {status_code} \
+                     with an empty body, so success at {OPT_SUCCESS_PATH} '{path}' cannot \
+                     be verified; treating the write as failed."
+                ));
+            }
+            return Ok(());
+        }
+        let parsed: JsonValue = serde_json::from_str(body_trimmed).map_err(|_| {
             format!(
                 "write to API endpoint ({safe_endpoint}) returned HTTP {status_code} \
                  but the response body is not valid JSON, so success at \
@@ -601,16 +637,9 @@ impl OpenApiFdw {
             _ => format!("{base}{resolved}"),
         };
 
-        // Add API key as query parameter if configured (mirrors build_url)
-        if let Some((ref param_name, ref param_value)) = self.config.api_key_query {
-            let separator = if url.contains('?') { '&' } else { '?' };
-            url.push(separator);
-            url.push_str(&format!(
-                "{}={}",
-                urlencoding::encode(param_name),
-                urlencoding::encode(param_value)
-            ));
-        }
+        // Add API key as query parameter if configured (shared with the read
+        // path; also avoids a throwaway String allocation per append).
+        self.append_api_key_query(&mut url);
 
         Ok((url, consumed))
     }

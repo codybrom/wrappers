@@ -130,7 +130,30 @@ fn test_build_column_key_map_empty_rows() {
 fn test_build_column_key_map_missing_column() {
     let rows = vec![serde_json::json!({"id": 1, "name": "alice"})];
     let map = build_key_map(&["id", "email"], rows, None);
-    assert_eq!(map, vec![Some(KeyMatch::Exact), None]);
+    // A column absent from the probe row is marked Missing (not None), so
+    // iter_scan skips the expensive per-row case-insensitive/normalized scan.
+    assert_eq!(map, vec![Some(KeyMatch::Exact), Some(KeyMatch::Missing)]);
+}
+
+#[test]
+fn test_build_column_key_map_normalized_unique_binds() {
+    // A single key normalizing to the column's alnum form still binds.
+    let rows = vec![serde_json::json!({"order-id": 1})];
+    let map = build_key_map(&["order_id"], rows, None);
+    assert_eq!(
+        map,
+        vec![Some(KeyMatch::CaseInsensitive("order-id".to_string()))]
+    );
+}
+
+#[test]
+fn test_build_column_key_map_normalized_ambiguous_is_missing() {
+    // Two keys that normalize to the same alnum form ('order-id' and
+    // 'order.id' → 'orderid') are ambiguous — the column is Missing, not bound
+    // to an arbitrary one of them.
+    let rows = vec![serde_json::json!({"order-id": 1, "order.id": 2})];
+    let map = build_key_map(&["order_id"], rows, None);
+    assert_eq!(map, vec![Some(KeyMatch::Missing)]);
 }
 
 #[test]
@@ -403,6 +426,40 @@ fn cell_to_string(cell: &Cell) -> Option<String> {
         Cell::String(s) => Some(s.clone()),
         _ => None,
     }
+}
+
+#[test]
+fn test_json_to_cell_cached_missing_column_still_matches_later_row() {
+    // A column absent from the probe (first) row is marked KeyMatch::Missing, but
+    // the Missing consumption arm still retries the cheap exact/camel lookups per
+    // row — so a LATER row that carries the column under its exact key must
+    // resolve. This pins that arm: reverting `KeyMatch::Missing => obj.get(...)`
+    // to `=> None` would make this return NULL, and no other test would catch it.
+    let mut fdw = OpenApiFdw {
+        // Probe row lacks "email", so it resolves to Missing.
+        src_rows: vec![serde_json::json!({"id": 1})],
+        ..Default::default()
+    };
+    fdw.cached_columns = ["id", "email"]
+        .iter()
+        .map(|name| CachedColumn {
+            name: name.to_string(),
+            type_oid: TypeOid::String,
+            camel_name: to_camel_case(name),
+            lower_name: name.to_lowercase(),
+            alnum_name: normalize_to_alnum(name),
+        })
+        .collect();
+    fdw.build_column_key_map();
+    assert_eq!(fdw.column_key_map[1], Some(KeyMatch::Missing));
+
+    // A later row DOES carry "email" under its exact key — must still resolve.
+    let later = serde_json::json!({"id": 2, "email": "bob@example.com"});
+    let cell = fdw.json_to_cell_cached(&later, 1).unwrap();
+    assert_eq!(
+        cell.as_ref().and_then(cell_to_string),
+        Some("bob@example.com".to_string())
+    );
 }
 
 #[test]
@@ -757,11 +814,11 @@ fn test_json_to_cell_path_param_injection() {
             lower_name: "user_id".to_string(),
             alnum_name: "userid".to_string(),
         }],
-        column_key_map: vec![None],
         ..Default::default()
     };
     fdw.injected_params
         .insert("user_id".to_string(), "42".to_string());
+    fdw.build_column_key_map();
 
     let obj = serde_json::json!({"title": "Post Title"});
     let cell = fdw.json_to_cell_cached(&obj, 0).unwrap();
@@ -782,15 +839,43 @@ fn test_json_to_cell_path_param_type_coercion() {
             lower_name: "id".to_string(),
             alnum_name: "id".to_string(),
         }],
-        column_key_map: vec![None],
         ..Default::default()
     };
     fdw.injected_params
         .insert("id".to_string(), "123".to_string());
+    fdw.build_column_key_map();
 
     let obj = serde_json::json!({});
     let cell = fdw.json_to_cell_cached(&obj, 0).unwrap();
     assert!(matches!(cell, Some(Cell::I64(123))));
+}
+
+#[test]
+fn test_json_to_cell_path_param_uuid_coercion() {
+    // An injected value for a uuid column becomes Cell::Uuid (type-symmetric
+    // with the read path), not a wrong-typed Cell::String.
+    let mut fdw = OpenApiFdw {
+        cached_columns: vec![CachedColumn {
+            name: "id".to_string(),
+            type_oid: TypeOid::Uuid,
+            camel_name: "id".to_string(),
+            lower_name: "id".to_string(),
+            alnum_name: "id".to_string(),
+        }],
+        ..Default::default()
+    };
+    fdw.injected_params.insert(
+        "id".to_string(),
+        "550e8400-e29b-41d4-a716-446655440000".to_string(),
+    );
+    fdw.build_column_key_map();
+
+    let obj = serde_json::json!({});
+    let cell = fdw.json_to_cell_cached(&obj, 0).unwrap();
+    assert!(
+        matches!(cell, Some(Cell::Uuid(ref u)) if u == "550e8400-e29b-41d4-a716-446655440000"),
+        "expected Cell::Uuid, got {cell:?}"
+    );
 }
 
 #[test]
@@ -804,11 +889,11 @@ fn test_json_to_cell_path_param_bool_coercion() {
             lower_name: "active".to_string(),
             alnum_name: "active".to_string(),
         }],
-        column_key_map: vec![None],
         ..Default::default()
     };
     fdw.injected_params
         .insert("active".to_string(), "true".to_string());
+    fdw.build_column_key_map();
 
     let obj = serde_json::json!({});
     let cell = fdw.json_to_cell_cached(&obj, 0).unwrap();
@@ -826,11 +911,11 @@ fn test_json_to_cell_path_param_f64_coercion() {
             lower_name: "lat".to_string(),
             alnum_name: "lat".to_string(),
         }],
-        column_key_map: vec![None],
         ..Default::default()
     };
     fdw.injected_params
         .insert("lat".to_string(), "37.7749".to_string());
+    fdw.build_column_key_map();
 
     let obj = serde_json::json!({});
     let cell = fdw.json_to_cell_cached(&obj, 0).unwrap();
@@ -852,19 +937,17 @@ fn test_json_to_cell_path_param_invalid_number_fallback() {
             lower_name: "id".to_string(),
             alnum_name: "id".to_string(),
         }],
-        column_key_map: vec![None],
         ..Default::default()
     };
     fdw.injected_params
         .insert("id".to_string(), "not-a-number".to_string());
+    fdw.build_column_key_map();
 
     let obj = serde_json::json!({});
     let cell = fdw.json_to_cell_cached(&obj, 0).unwrap();
-    // i64 parse fails → falls back to Cell::String
-    assert_eq!(
-        cell_to_string(cell.as_ref().unwrap()),
-        Some("not-a-number".to_string())
-    );
+    // i64 parse fails → NULL, not a wrong-typed Cell::String: the injected
+    // value must not be handed to the executor as a String for an i64 column.
+    assert!(cell.is_none());
 }
 
 #[test]
@@ -878,11 +961,11 @@ fn test_json_to_cell_path_param_json_type() {
             lower_name: "filter".to_string(),
             alnum_name: "filter".to_string(),
         }],
-        column_key_map: vec![None],
         ..Default::default()
     };
     fdw.injected_params
         .insert("filter".to_string(), r#"{"status":"active"}"#.to_string());
+    fdw.build_column_key_map();
 
     let obj = serde_json::json!({});
     let cell = fdw.json_to_cell_cached(&obj, 0).unwrap();
@@ -1026,4 +1109,86 @@ fn test_json_to_cell_case_insensitive_key_match() {
         cell_to_string(cell.as_ref().unwrap()),
         Some("alice".to_string())
     );
+}
+
+// --- is_canonical_uuid / uuid coercion tests ---
+
+#[test]
+fn test_is_canonical_uuid_accepts_canonical_form() {
+    assert!(is_canonical_uuid("550e8400-e29b-41d4-a716-446655440000"));
+    // Case-insensitive hex.
+    assert!(is_canonical_uuid("550E8400-E29B-41D4-A716-446655440000"));
+}
+
+#[test]
+fn test_is_canonical_uuid_rejects_malformed() {
+    for bad in [
+        "",
+        "not-a-uuid",
+        // unhyphenated 32-hex is not the canonical form
+        "550e8400e29b41d4a716446655440000",
+        // wrong group lengths
+        "550e840-e29b-41d4-a716-446655440000",
+        "550e8400-e29b-41d4-a716-44665544000",
+        // non-hex character
+        "550e8400-e29b-41d4-a716-44665544000g",
+        // trailing extra group
+        "550e8400-e29b-41d4-a716-446655440000-abcd",
+        // empty groups
+        "----",
+    ] {
+        assert!(!is_canonical_uuid(bad), "should reject {bad:?}");
+    }
+}
+
+#[test]
+fn test_convert_string_to_cell_uuid_rejects_malformed() {
+    // A non-UUID injected value degrades to NULL rather than becoming a
+    // malformed Cell::Uuid that only fails later inside Postgres.
+    assert!(OpenApiFdw::convert_string_to_cell("not-a-uuid", &TypeOid::Uuid).is_none());
+    assert!(
+        matches!(
+            OpenApiFdw::convert_string_to_cell("550e8400-e29b-41d4-a716-446655440000", &TypeOid::Uuid),
+            Some(Cell::Uuid(ref u)) if u == "550e8400-e29b-41d4-a716-446655440000"
+        ),
+        "canonical uuid should still convert"
+    );
+}
+
+#[test]
+fn test_convert_json_to_cell_uuid_rejects_malformed() {
+    let bad = serde_json::json!("nope");
+    assert!(
+        OpenApiFdw::convert_json_to_cell(&bad, &TypeOid::Uuid)
+            .unwrap()
+            .is_none()
+    );
+    let good = serde_json::json!("550e8400-e29b-41d4-a716-446655440000");
+    assert!(matches!(
+        OpenApiFdw::convert_json_to_cell(&good, &TypeOid::Uuid).unwrap(),
+        Some(Cell::Uuid(_))
+    ));
+}
+
+// --- truncate_for_log tests ---
+
+#[test]
+fn test_truncate_for_log_short_value_unchanged() {
+    assert_eq!(truncate_for_log("abc"), "abc");
+}
+
+#[test]
+fn test_truncate_for_log_truncates_long_value() {
+    let long = "x".repeat(200);
+    let out = truncate_for_log(&long);
+    assert!(out.ends_with('…'));
+    assert_eq!(out.chars().count(), MAX_DEBUG_VALUE_LEN + 1);
+}
+
+#[test]
+fn test_truncate_for_log_respects_char_boundaries() {
+    // Multi-byte chars must not be sliced mid-character (would panic).
+    let long = "é".repeat(200);
+    let out = truncate_for_log(&long);
+    assert_eq!(out.chars().count(), MAX_DEBUG_VALUE_LEN + 1);
 }

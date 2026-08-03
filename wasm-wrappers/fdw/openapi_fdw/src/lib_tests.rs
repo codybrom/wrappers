@@ -50,6 +50,124 @@ fn test_validate_url_empty_string() {
     assert!(err.contains("Invalid base_url"));
 }
 
+// --- ensure_base_url ---
+
+#[test]
+fn test_ensure_base_url_derives_from_spec_servers() {
+    // A spec-only server (no explicit base_url) must resolve base_url from the
+    // spec's servers before a request is built. The read path does this in
+    // begin_scan; begin_modify does it for writes so a bare INSERT on a
+    // spec-configured writable table doesn't build a scheme-less URL.
+    let mut fdw = OpenApiFdw::default();
+    fdw.config.base_url = String::new();
+    fdw.config.spec_json = Some("provided".to_string());
+    fdw.spec = Some(
+        OpenApiSpec::from_str(
+            r#"{"openapi":"3.0.0","info":{"title":"t"},
+               "servers":[{"url":"https://api.example.com/v1/"}]}"#,
+        )
+        .unwrap(),
+    );
+
+    fdw.ensure_base_url().unwrap();
+
+    // Derived from the spec's first server, trailing slash trimmed.
+    assert_eq!(fdw.config.base_url, "https://api.example.com/v1");
+}
+
+#[test]
+fn test_ensure_base_url_keeps_explicit_base_url() {
+    // An explicit base_url is authoritative and never overridden by the spec.
+    let mut fdw = OpenApiFdw::default();
+    fdw.config.base_url = "https://explicit.example.com".to_string();
+    fdw.config.spec_json = Some("provided".to_string());
+    fdw.spec = Some(
+        OpenApiSpec::from_str(
+            r#"{"openapi":"3.0.0","info":{"title":"t"},
+               "servers":[{"url":"https://api.example.com/v1"}]}"#,
+        )
+        .unwrap(),
+    );
+
+    fdw.ensure_base_url().unwrap();
+
+    assert_eq!(fdw.config.base_url, "https://explicit.example.com");
+}
+
+#[test]
+fn test_ensure_base_url_noop_without_spec_config() {
+    // No base_url and no spec configured: nothing to resolve, stays empty
+    // (a plain base_url-less table that never reaches a request).
+    let mut fdw = OpenApiFdw::default();
+    fdw.config.base_url = String::new();
+
+    fdw.ensure_base_url().unwrap();
+
+    assert!(fdw.config.base_url.is_empty());
+}
+
+// --- qual_allows_limit_pushdown ---
+
+#[test]
+fn test_qual_allows_limit_pushdown_equality_no_or_pushable() {
+    // A non-OR '=' qual with a stringifiable value is pushed down and
+    // re-injected, so Postgres keeps every source row: an early LIMIT is safe.
+    assert!(qual_allows_limit_pushdown("=", false, true));
+}
+
+#[test]
+fn test_qual_allows_limit_pushdown_rejects_or_equality() {
+    // An OR'd equality is filtered locally, so a source-side LIMIT could
+    // under-return; not pushdown-safe even with a pushable value.
+    assert!(!qual_allows_limit_pushdown("=", true, true));
+}
+
+#[test]
+fn test_qual_allows_limit_pushdown_rejects_non_equality() {
+    // Any operator other than '=' is filtered locally and drops source rows.
+    for op in ["<", ">", ">=", "<=", "<>", "!=", "~~", "like", "in"] {
+        assert!(
+            !qual_allows_limit_pushdown(op, false, true),
+            "operator {op} must not be pushdown-safe"
+        );
+    }
+}
+
+#[test]
+fn test_qual_allows_limit_pushdown_rejects_unpushable_value() {
+    // A '=' qual whose value cannot be stringified (numeric/date/timestamp/json)
+    // is neither pushed to the API nor injected, so it is filtered locally and
+    // an early source-side LIMIT would under-return. Not pushdown-safe.
+    assert!(!qual_allows_limit_pushdown("=", false, false));
+}
+
+// --- reject_rowid_reassignment ---
+
+#[test]
+fn test_reject_rowid_reassignment_absent_is_ok() {
+    // The row carries no new value for the rowid column: nothing to reject.
+    let params = std::collections::HashMap::new();
+    assert!(reject_rowid_reassignment(&params, "id", "42").is_ok());
+}
+
+#[test]
+fn test_reject_rowid_reassignment_same_value_is_ok() {
+    // The row restates the same rowid value: harmless, allowed.
+    let params = std::collections::HashMap::from([("id".to_string(), "42".to_string())]);
+    assert!(reject_rowid_reassignment(&params, "id", "42").is_ok());
+}
+
+#[test]
+fn test_reject_rowid_reassignment_changed_value_errors() {
+    // The row assigns a different rowid: rejected, and the error names the
+    // column plus both the old and new values.
+    let params = std::collections::HashMap::from([("id".to_string(), "99".to_string())]);
+    let err = reject_rowid_reassignment(&params, "id", "42").unwrap_err();
+    assert!(err.contains("id"));
+    assert!(err.contains("42"));
+    assert!(err.contains("99"));
+}
+
 // --- parse_usize_option ---
 
 #[test]
@@ -119,7 +237,34 @@ fn test_parse_bool_flag_none() {
 
 #[test]
 fn test_parse_bool_flag_random_string() {
-    assert!(!parse_bool_flag(Some("yes")));
+    assert!(!parse_bool_flag(Some("banana")));
+}
+
+#[test]
+fn test_parse_bool_flag_case_insensitive_and_aliases() {
+    // Case-insensitive, with yes/on aliases, so `writable 'TRUE'` is not
+    // silently read as false.
+    assert!(parse_bool_flag(Some("TRUE")));
+    assert!(parse_bool_flag(Some("True")));
+    assert!(parse_bool_flag(Some("YES")));
+    assert!(parse_bool_flag(Some("on")));
+    assert!(parse_bool_flag(Some(" 1 ")));
+    assert!(!parse_bool_flag(Some("off")));
+    assert!(!parse_bool_flag(Some("FALSE")));
+}
+
+#[test]
+fn test_parse_bool_flag_default_true() {
+    use crate::parse_bool_flag_default_true;
+    // Defaults to true; only explicit false-ish values (case-insensitive) disable it.
+    assert!(parse_bool_flag_default_true(None));
+    assert!(parse_bool_flag_default_true(Some("true")));
+    assert!(parse_bool_flag_default_true(Some("anything")));
+    assert!(!parse_bool_flag_default_true(Some("false")));
+    assert!(!parse_bool_flag_default_true(Some("FALSE")));
+    assert!(!parse_bool_flag_default_true(Some("0")));
+    assert!(!parse_bool_flag_default_true(Some("no")));
+    assert!(!parse_bool_flag_default_true(Some("off")));
 }
 
 // --- should_stop_scanning ---
