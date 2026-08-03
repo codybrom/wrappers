@@ -33,6 +33,19 @@ fn test_apply_session_token_custom_prefix() {
 }
 
 #[test]
+fn test_apply_session_token_strips_control_chars() {
+    // A session GUC value carrying CR/LF must not be able to inject a second
+    // header (request splitting); control characters are stripped so the value
+    // stays a single header.
+    let mut headers = vec![];
+    ServerConfig::apply_session_token(&mut headers, "abc\r\nX-Evil: 1", "Bearer");
+    assert_eq!(headers.len(), 1);
+    assert_eq!(headers[0].1, "Bearer abcX-Evil: 1");
+    assert!(!headers[0].1.contains('\r'));
+    assert!(!headers[0].1.contains('\n'));
+}
+
+#[test]
 fn test_apply_session_token_empty_prefix_no_prefix() {
     // Empty prefix → raw token value, no leading space
     let mut headers = vec![];
@@ -519,6 +532,77 @@ fn test_auth_api_key_default_header_authorization() {
     assert_eq!(config.headers.len(), 1);
     assert_eq!(config.headers[0].0, "authorization");
     assert_eq!(config.headers[0].1, "Bearer my-api-key");
+}
+
+#[test]
+fn test_auth_bearer_replaces_headers_option_authorization() {
+    // An `authorization` header supplied via the `headers` option is replaced,
+    // not duplicated, when bearer_token auth is also configured.
+    let mut config = ServerConfig::default();
+    config
+        .apply_headers(
+            None,
+            None,
+            Some(r#"{"Authorization": "Bearer stale"}"#.to_string()),
+        )
+        .unwrap();
+    config
+        .apply_auth(
+            None,
+            Some("live-token".to_string()),
+            "header",
+            "Authorization",
+            None,
+        )
+        .unwrap();
+    let auth: Vec<_> = config
+        .headers
+        .iter()
+        .filter(|h| h.0.eq_ignore_ascii_case("authorization"))
+        .collect();
+    assert_eq!(auth.len(), 1, "exactly one authorization header expected");
+    assert_eq!(auth[0].1, "Bearer live-token");
+}
+
+#[test]
+fn test_auth_api_key_header_replaces_headers_option_same_name() {
+    // An api_key placed in a custom header replaces a same-named header from the
+    // `headers` option rather than sending two.
+    let mut config = ServerConfig::default();
+    config
+        .apply_headers(None, None, Some(r#"{"X-API-Key": "stale"}"#.to_string()))
+        .unwrap();
+    config
+        .apply_auth(Some("live".to_string()), None, "header", "X-API-Key", None)
+        .unwrap();
+    let matches: Vec<_> = config
+        .headers
+        .iter()
+        .filter(|h| h.0.eq_ignore_ascii_case("x-api-key"))
+        .collect();
+    assert_eq!(matches.len(), 1);
+    assert_eq!(matches[0].1, "live");
+}
+
+#[test]
+fn test_auth_api_key_cookie_replaces_headers_option_same_name() {
+    // An api_key sent as a cookie replaces a same-named `cookie` header from the
+    // `headers` option rather than appending a second one (two Cookie headers is
+    // ambiguous/duplicated), matching the header/bearer auth branches.
+    let mut config = ServerConfig::default();
+    config
+        .apply_headers(None, None, Some(r#"{"Cookie": "stale=1"}"#.to_string()))
+        .unwrap();
+    config
+        .apply_auth(Some("live".to_string()), None, "cookie", "session", None)
+        .unwrap();
+    let matches: Vec<_> = config
+        .headers
+        .iter()
+        .filter(|h| h.0.eq_ignore_ascii_case("cookie"))
+        .collect();
+    assert_eq!(matches.len(), 1);
+    assert_eq!(matches[0].1, "session=live");
 }
 
 #[test]

@@ -98,7 +98,31 @@ impl Default for ServerConfig {
     }
 }
 
+/// Remove control characters (CR, LF, and other C0 controls) from a value
+/// destined for an HTTP header, preventing header/request-splitting injection
+/// via a crafted credential or session GUC value.
+fn sanitize_header_value(value: &str) -> String {
+    value.chars().filter(|c| !c.is_control()).collect()
+}
+
 impl ServerConfig {
+    /// Insert or replace a header case-insensitively.
+    ///
+    /// HTTP header names are case-insensitive, so configured auth must replace a
+    /// same-named header supplied via the `headers` option rather than append a
+    /// second one (two `Authorization` headers is ambiguous/duplicated auth).
+    fn upsert_header(&mut self, name: String, value: String) {
+        if let Some(h) = self
+            .headers
+            .iter_mut()
+            .find(|h| h.0.eq_ignore_ascii_case(&name))
+        {
+            h.1 = value;
+        } else {
+            self.headers.push((name, value));
+        }
+    }
+
     /// Snapshot the current pagination fields as server-level defaults.
     ///
     /// Call once at the end of init(), after server options are parsed.
@@ -266,9 +290,14 @@ impl ServerConfig {
                     self.api_key_query = Some((api_key_header.to_string(), key));
                 }
                 "cookie" => {
-                    // API key sent as cookie (e.g., Cookie: session=xxx)
-                    self.headers
-                        .push(("cookie".to_owned(), format!("{api_key_header}={key}")));
+                    // API key sent as cookie (e.g., Cookie: session=xxx).
+                    // Replace, rather than append alongside, a same-named
+                    // `cookie` header from the `headers` option so auth is never
+                    // sent twice; strip any control characters from the value.
+                    self.upsert_header(
+                        "cookie".to_owned(),
+                        sanitize_header_value(&format!("{api_key_header}={key}")),
+                    );
                 }
                 "header" => {
                     // API key sent as header (default)
@@ -278,8 +307,13 @@ impl ServerConfig {
                         (_, None) => key,
                     };
 
-                    self.headers
-                        .push((api_key_header.to_lowercase(), header_value));
+                    // Replace, rather than append alongside, a same-named header
+                    // from the `headers` option so auth is never sent twice; strip
+                    // any control characters from the value.
+                    self.upsert_header(
+                        api_key_header.to_lowercase(),
+                        sanitize_header_value(&header_value),
+                    );
                 }
                 other => {
                     return Err(format!(
@@ -291,8 +325,12 @@ impl ServerConfig {
         }
 
         if let Some(token) = bearer_token {
-            self.headers
-                .push(("authorization".to_owned(), format!("Bearer {token}")));
+            // Replace, rather than append alongside, an authorization header
+            // supplied via the `headers` option; strip any control characters.
+            self.upsert_header(
+                "authorization".to_owned(),
+                sanitize_header_value(&format!("Bearer {token}")),
+            );
         }
 
         Ok(())
@@ -312,8 +350,11 @@ impl ServerConfig {
         if token.trim().is_empty() {
             return;
         }
+        // Strip control characters (CR/LF etc.) from the session-supplied token
+        // to prevent header/request splitting via a crafted session GUC value.
+        let token = sanitize_header_value(token);
         let value = if prefix.is_empty() {
-            token.to_owned()
+            token
         } else {
             format!("{prefix} {token}")
         };

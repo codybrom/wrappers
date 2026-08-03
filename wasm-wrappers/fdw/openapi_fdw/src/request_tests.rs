@@ -276,44 +276,138 @@ fn test_redact_query_param_encoded_name() {
     );
 }
 
-// --- URL encoding security tests ---
-
 #[test]
-fn test_rowid_url_encoding_path_traversal() {
-    // Verify urlencoding::encode handles path traversal attempts
-    let malicious_id = "../admin";
-    let encoded = urlencoding::encode(malicious_id);
-    assert_eq!(encoded, "..%2Fadmin");
-    // Resulting URL would be /items/..%2Fadmin (safe) not /items/../admin (traversal)
-}
-
-#[test]
-fn test_rowid_url_encoding_query_injection() {
-    // Verify urlencoding::encode handles query injection attempts
-    let malicious_id = "123?admin=true";
-    let encoded = urlencoding::encode(malicious_id);
-    assert_eq!(encoded, "123%3Fadmin%3Dtrue");
-}
-
-#[test]
-fn test_rowid_url_encoding_special_chars() {
-    // Verify urlencoding::encode handles various URL-unsafe chars
-    let special = "id with spaces&more=stuff#fragment";
-    let encoded = urlencoding::encode(special);
-    assert!(!encoded.contains(' '));
-    assert!(!encoded.contains('&'));
-    assert!(!encoded.contains('='));
-    assert!(!encoded.contains('#'));
-}
-
-#[test]
-fn test_rowid_url_encoding_normal_ids() {
-    // Normal IDs should pass through unchanged
-    assert_eq!(urlencoding::encode("123"), "123");
-    assert_eq!(urlencoding::encode("abc-def"), "abc-def");
+fn test_redact_query_param_prefix_collision() {
+    // An earlier param whose name merely *ends with* the key's name
+    // ('sortkey' vs 'key') must NOT be redacted in place of the real secret,
+    // which is appended last. Only a boundary-anchored ('?'/'&') match counts.
+    let url = "https://api.example.com/items?sortkey=5&key=SUPERSECRET";
+    let redacted = redact_query_param(url, "key");
     assert_eq!(
-        urlencoding::encode("550e8400-e29b-41d4-a716-446655440000"),
-        "550e8400-e29b-41d4-a716-446655440000"
+        redacted,
+        "https://api.example.com/items?sortkey=5&key=[REDACTED]"
+    );
+    assert!(!redacted.contains("SUPERSECRET"));
+    assert!(redacted.contains("sortkey=5"));
+}
+
+#[test]
+fn test_redact_query_param_first_param_boundary() {
+    // The key as the first query param (preceded by '?') is still redacted, and
+    // a later param sharing the suffix is untouched.
+    let url = "https://api.example.com/items?key=SECRET&sortkey=5";
+    let redacted = redact_query_param(url, "key");
+    assert_eq!(
+        redacted,
+        "https://api.example.com/items?key=[REDACTED]&sortkey=5"
+    );
+    assert!(!redacted.contains("SECRET"));
+}
+
+#[test]
+fn test_redact_query_param_redacts_all_occurrences() {
+    // The secret can appear more than once (e.g. a pagination next_url that
+    // echoes the request query string and then re-appends the api_key). EVERY
+    // boundary-anchored occurrence must be redacted, not just the first.
+    let url = "https://api.example.com/items?api_key=SECRET&cursor=abc&api_key=SECRET";
+    let redacted = redact_query_param(url, "api_key");
+    assert_eq!(
+        redacted,
+        "https://api.example.com/items?api_key=[REDACTED]&cursor=abc&api_key=[REDACTED]"
+    );
+    assert!(!redacted.contains("SECRET"));
+}
+
+// --- build_single_resource_url: rowid pushdown URL construction ---
+
+fn make_fdw_for_single_resource(
+    base_url: &str,
+    api_key_query: Option<(String, String)>,
+) -> OpenApiFdw {
+    OpenApiFdw {
+        config: ServerConfig {
+            base_url: base_url.to_string(),
+            api_key_query,
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+#[test]
+fn test_single_resource_url_basic() {
+    let fdw = make_fdw_for_single_resource("https://api.example.com", None);
+    assert_eq!(
+        fdw.build_single_resource_url("/items", "123"),
+        "https://api.example.com/items/123"
+    );
+}
+
+#[test]
+fn test_single_resource_url_encodes_path_traversal() {
+    // Drives the real production path: ../admin must be percent-encoded so it
+    // cannot escape /items.
+    let fdw = make_fdw_for_single_resource("https://api.example.com", None);
+    assert_eq!(
+        fdw.build_single_resource_url("/items", "../admin"),
+        "https://api.example.com/items/..%2Fadmin"
+    );
+}
+
+#[test]
+fn test_single_resource_url_encodes_query_injection() {
+    let fdw = make_fdw_for_single_resource("https://api.example.com", None);
+    assert_eq!(
+        fdw.build_single_resource_url("/items", "123?admin=true"),
+        "https://api.example.com/items/123%3Fadmin%3Dtrue"
+    );
+}
+
+#[test]
+fn test_single_resource_url_trims_trailing_slash() {
+    // A trailing slash on the endpoint must not produce a doubled slash.
+    let fdw = make_fdw_for_single_resource("https://api.example.com", None);
+    assert_eq!(
+        fdw.build_single_resource_url("/items/", "5"),
+        "https://api.example.com/items/5"
+    );
+}
+
+#[test]
+fn test_single_resource_url_preserves_static_query() {
+    // A static query string stays a query; the id joins the path, not the
+    // value of the last query param.
+    let fdw = make_fdw_for_single_resource("https://api.example.com", None);
+    assert_eq!(
+        fdw.build_single_resource_url("/search?type=active", "5"),
+        "https://api.example.com/search/5?type=active"
+    );
+}
+
+#[test]
+fn test_single_resource_url_appends_api_key_query() {
+    // The query-auth key must ride along on the single-resource path, or the
+    // request goes out unauthenticated.
+    let fdw = make_fdw_for_single_resource(
+        "https://api.example.com",
+        Some(("api_key".to_string(), "secret123".to_string())),
+    );
+    assert_eq!(
+        fdw.build_single_resource_url("/items", "123"),
+        "https://api.example.com/items/123?api_key=secret123"
+    );
+}
+
+#[test]
+fn test_single_resource_url_api_key_after_static_query() {
+    // The api_key joins with '&' when a static query is already present.
+    let fdw = make_fdw_for_single_resource(
+        "https://api.example.com",
+        Some(("api_key".to_string(), "secret123".to_string())),
+    );
+    assert_eq!(
+        fdw.build_single_resource_url("/search?type=active", "5"),
+        "https://api.example.com/search/5?type=active&api_key=secret123"
     );
 }
 
@@ -538,18 +632,11 @@ fn test_resolve_pagination_url_appends_api_key_query() {
         ..Default::default()
     };
 
-    // Simulate what build_url does for URL-based pagination
+    // Drive the real production helper that build_url uses for URL-based
+    // pagination, rather than reimplementing the append inline.
     let next_url = fdw.pagination.next.as_ref().unwrap().as_url().unwrap();
     let mut url = fdw.resolve_pagination_url(next_url).unwrap();
-    if let Some((ref param_name, ref param_value)) = fdw.config.api_key_query {
-        let separator = if url.contains('?') { '&' } else { '?' };
-        url.push(separator);
-        url.push_str(&format!(
-            "{}={}",
-            urlencoding::encode(param_name),
-            urlencoding::encode(param_value)
-        ));
-    }
+    fdw.append_api_key_query(&mut url);
     assert_eq!(
         url,
         "https://api.example.com/items?page=2&api_key=secret123"
@@ -693,4 +780,17 @@ fn test_method_label_all_verbs() {
     assert_eq!(method_label(http::Method::Put), "PUT");
     assert_eq!(method_label(http::Method::Patch), "PATCH");
     assert_eq!(method_label(http::Method::Delete), "DELETE");
+}
+
+// --- retry idempotency gate ---
+
+#[test]
+fn test_method_is_idempotent() {
+    // The guest-side retry loop may re-send safe verbs (GET/PUT/DELETE) but must
+    // not re-send POST/PATCH, whose bodies could compound side effects.
+    assert!(method_is_idempotent(http::Method::Get));
+    assert!(method_is_idempotent(http::Method::Put));
+    assert!(method_is_idempotent(http::Method::Delete));
+    assert!(!method_is_idempotent(http::Method::Post));
+    assert!(!method_is_idempotent(http::Method::Patch));
 }

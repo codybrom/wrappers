@@ -43,17 +43,40 @@ fn extract_origin(url: &str) -> &str {
 
 /// Redact a query parameter value from a URL for safe logging.
 /// Replaces the value of the named parameter with [REDACTED].
+///
+/// The match must sit on a query-parameter boundary (immediately after `?` or
+/// `&`). Without that anchor, a parameter whose name merely *ends with*
+/// `param_name` (e.g. `sortkey` vs `key`) would be redacted, leaving the real
+/// secret in cleartext. EVERY boundary-anchored occurrence is redacted, not
+/// just the first: a secret can appear more than once in a URL (e.g. a
+/// pagination `next_url` that echoes the request query string and then has the
+/// api_key appended again), and redacting only the first would leak the rest.
 pub(crate) fn redact_query_param(url: &str, param_name: &str) -> String {
-    let encoded_prefix = format!("{}=", urlencoding::encode(param_name));
-    if let Some(start) = url.find(&encoded_prefix) {
-        let value_start = start + encoded_prefix.len();
-        let value_end = url[value_start..]
-            .find('&')
-            .map_or(url.len(), |i| value_start + i);
-        format!("{}[REDACTED]{}", &url[..value_start], &url[value_end..])
-    } else {
-        url.to_string()
+    let needle = format!("{}=", urlencoding::encode(param_name));
+    let bytes = url.as_bytes();
+    let mut out = String::with_capacity(url.len());
+    let mut copied = 0; // end of what has been copied into `out`
+    let mut search_from = 0;
+    while let Some(rel) = url[search_from..].find(&needle) {
+        let start = search_from + rel;
+        let value_start = start + needle.len();
+        if start == 0 || matches!(bytes[start - 1], b'?' | b'&') {
+            let value_end = url[value_start..]
+                .find('&')
+                .map_or(url.len(), |i| value_start + i);
+            out.push_str(&url[copied..value_start]);
+            out.push_str("[REDACTED]");
+            copied = value_end;
+            search_from = value_end;
+        } else {
+            // A non-boundary match (e.g. `sortkey=` when redacting `key`): skip
+            // past it without redacting, and keep scanning for a real boundary
+            // occurrence later in the URL.
+            search_from = value_start;
+        }
     }
+    out.push_str(&url[copied..]);
+    out
 }
 
 /// Human-readable HTTP method name for debug logging.
@@ -67,13 +90,25 @@ pub(crate) fn method_label(method: http::Method) -> &'static str {
     }
 }
 
+/// Whether the guest-side retry loop may safely re-send this method. POST and
+/// PATCH are not idempotent, so re-sending a body-bearing request could compound
+/// side effects; only safe verbs (GET/PUT/DELETE) are retried on the read path.
+pub(crate) fn method_is_idempotent(method: http::Method) -> bool {
+    !matches!(method, http::Method::Post | http::Method::Patch)
+}
+
 impl OpenApiFdw {
     /// Fetch and parse the OpenAPI spec
     pub(crate) fn fetch_spec(&mut self) -> Result<(), FdwError> {
         if let Some(ref url) = self.config.spec_url {
+            // Apply query-string auth to the spec download too — with
+            // api_key_location = 'query' the key lives only in the query string,
+            // so a spec_url behind the same auth would otherwise 401 at IMPORT.
+            let mut spec_url = url.clone();
+            self.append_api_key_query(&mut spec_url);
             let req = http::Request {
                 method: http::Method::Get,
-                url: url.clone(),
+                url: spec_url,
                 headers: self.config.headers.clone(),
                 body: String::default(),
             };
@@ -288,6 +323,45 @@ impl OpenApiFdw {
         Ok((endpoint, path_params_used))
     }
 
+    /// Append the configured query-string API key to an already-built URL,
+    /// choosing the correct `?`/`&` separator. Centralizing this ensures no
+    /// request path (pagination, single-resource rowid pushdown, spec fetch)
+    /// can silently omit query-auth credentials.
+    pub(crate) fn append_api_key_query(&self, url: &mut String) {
+        if let Some((ref param_name, ref param_value)) = self.config.api_key_query {
+            url.push(if url.contains('?') { '&' } else { '?' });
+            url.push_str(&urlencoding::encode(param_name));
+            url.push('=');
+            url.push_str(&urlencoding::encode(param_value));
+        }
+    }
+
+    /// Build the URL for single-resource (rowid) access: `base/endpoint/{id}`.
+    ///
+    /// Splits any static query string off the endpoint so the id is appended to
+    /// the path rather than the query (e.g. `/search?type=active` → the id joins
+    /// `/search`, not the value of `type`), trims a trailing `/` to avoid a
+    /// doubled slash, and appends the query-string API key so the request stays
+    /// authenticated.
+    pub(crate) fn build_single_resource_url(&self, endpoint: &str, id: &str) -> String {
+        let (path, query) = match endpoint.split_once('?') {
+            Some((p, q)) => (p.trim_end_matches('/'), Some(q)),
+            None => (endpoint.trim_end_matches('/'), None),
+        };
+        let mut url = format!(
+            "{}{}/{}",
+            self.config.base_url,
+            path,
+            urlencoding::encode(id)
+        );
+        if let Some(q) = query {
+            url.push('?');
+            url.push_str(q);
+        }
+        self.append_api_key_query(&mut url);
+        url
+    }
+
     /// Build query parameters from pagination state, quals, and API key.
     ///
     /// Returns (url_params, injected_entries) where injected_entries are
@@ -311,10 +385,17 @@ impl OpenApiFdw {
             ));
         }
 
-        // Add page size if configured, reduced by LIMIT when available
+        // Add page size if configured, reduced by LIMIT when available.
+        // `src_limit` is only Some when the LIMIT can be honored remotely (no
+        // locally-filtered quals — see begin_scan), so capping here is safe.
         if self.config.page_size > 0 && !self.config.page_size_param.is_empty() {
             let effective_size = match self.src_limit {
-                Some(limit) if limit > 0 => self.config.page_size.min(limit as usize),
+                // usize::try_from guards the 32-bit wasm target, where a raw
+                // `as usize` would truncate a LIMIT above u32::MAX.
+                Some(limit) if limit > 0 => self
+                    .config
+                    .page_size
+                    .min(usize::try_from(limit).unwrap_or(usize::MAX)),
                 _ => self.config.page_size,
             };
             params.push(format!(
@@ -379,15 +460,7 @@ impl OpenApiFdw {
         // Use next_url for pagination if available (injected_params unchanged)
         if let Some(next_url) = self.pagination.next.as_ref().and_then(|t| t.as_url()) {
             let mut url = self.resolve_pagination_url(next_url)?;
-            if let Some((ref param_name, ref param_value)) = self.config.api_key_query {
-                let separator = if url.contains('?') { '&' } else { '?' };
-                url.push(separator);
-                url.push_str(&format!(
-                    "{}={}",
-                    urlencoding::encode(param_name),
-                    urlencoding::encode(param_value)
-                ));
-            }
+            self.append_api_key_query(&mut url);
             return Ok(url);
         }
 
@@ -422,12 +495,7 @@ impl OpenApiFdw {
                 if let Some(id) = Self::qual_value_to_string(id_qual) {
                     self.injected_params
                         .insert(self.rowid_col.clone(), id.clone());
-                    return Ok(format!(
-                        "{}{}/{}",
-                        self.config.base_url,
-                        endpoint,
-                        urlencoding::encode(&id)
-                    ));
+                    return Ok(self.build_single_resource_url(&endpoint, &id));
                 }
             }
         }
@@ -490,10 +558,17 @@ impl OpenApiFdw {
         let mut retry_count = 0;
         const MAX_RETRIES: u32 = 3;
 
+        // Only the guest-side loop retries idempotent verbs. POST/PATCH (e.g. a
+        // POST-as-query read) are not idempotent, and the host HTTP middleware
+        // already retries transient failures; retrying here too would compound
+        // to several re-sends of one body-bearing request. The write path avoids
+        // this entirely via send_once.
+        let idempotent = method_is_idempotent(self.method);
+
         let resp = loop {
             let resp = Self::send_once(&req)?;
 
-            let is_retryable = matches!(resp.status_code, 429 | 502 | 503);
+            let is_retryable = idempotent && matches!(resp.status_code, 429 | 502 | 503);
             if is_retryable {
                 if retry_count >= MAX_RETRIES {
                     let hint = if resp.status_code == 429 {
